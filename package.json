@@ -1,13 +1,13 @@
 {
   "name": "@x-mug/dsh-auto-review-cache-identity",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "private": true,
   "repository": {
     "type": "git",
     "url": "https://github.com/x-mug/dsh-auto-review-cache-identity.git"
   },
   "type": "module",
-  "description": "Stable auto-review identity and native Anthropic cache breakpoints, including Desktop Request transport.",
+  "description": "Stable auto-review identity and cache segmentation for Anthropic Messages and OpenAI chat/responses review calls.",
   "peerDependencies": {
     "@deepseek-ai/dsh-llm": "*",
     "dsh-session-header": "*"

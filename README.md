@@ -2,7 +2,7 @@
 
 给内置 Auto 审查（`@deepseek-ai/dsh-experimental-auto-review`）的模型调用补一个稳定的缓存身份，让审查请求的 prompt 前缀能跨调用复用；同时可以在设置页里给审查单独指定一个模型。
 
-版本 **1.1.2**，插件包名为 `@x-mug/dsh-auto-review-cache-identity`。兼容基线为 **DeepSeek Harness Desktop 0.2.1-rc.5 / Cordis 4.0.5**。插件依赖 DSH 内部的服务钩子与客户端槽位，其他版本需要重新验证。
+版本 **1.2.0**，插件包名为 `@x-mug/dsh-auto-review-cache-identity`。兼容基线为 **DeepSeek Harness Desktop 0.2.1-rc.5 / Cordis 4.0.5**。插件依赖 DSH 内部的服务钩子与客户端槽位，其他版本需要重新验证。
 
 ## 为什么需要它
 
@@ -140,6 +140,10 @@ ctx.get('agents')?.currentInitiator()?.session?.id
 审查发生在 `tools/pre-execute` 的监听器里、`ctx.llm.stream` 之前，同一条 await 链，所以读到的就是发起这次工具调用的会话。服务被 dispose 后 `currentInitiator()` 会抛，读取必须包 `try`。
 
 **读不到会话就不注入，原样放过。** 不退回 cwd：同一目录下几十个互不相干的会话和子代理会塌成同一个身份，把几十条审查链塞进一条缓存，还让它们长期共用一个账号——"稳定地错"比"没有"危险，而且从日志和命中率上都看不出来。
+
+## OpenAI 审核路径
+
+`/v1/chat/completions` 与 `/v1/responses` 的审核请求同样改写：按历史条目拆成多条消息，稳定头部单独成段，待审动作留在末尾，并补 `prompt_cache_key` 固定缓存分区。策略消息既可能是 `system` 也可能是 `developer`，两种都识别。
 
 ## 已知限制
 

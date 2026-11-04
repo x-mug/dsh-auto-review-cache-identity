@@ -166,6 +166,91 @@ async function rewriteAnthropicRequest(input, init, checkpoints, identity) {
   }
 }
 
+/** 从消息里取审核文本，字符串和单段 text 都认。 */
+function reviewTextOf(message) {
+  const content = message?.content
+  if (typeof content === 'string') return { plain: true, text: content }
+  if (Array.isArray(content) && content.length === 1 && content[0]?.type === 'text' && typeof content[0].text === 'string') return { plain: false, text: content[0].text }
+  return undefined
+}
+
+/** 缓存键钉在一段审核会话上，避免上游按请求分散。 */
+function reviewCacheKey(identity) {
+  if (typeof identity !== 'string' || identity === '') return undefined
+  return 'auto-review-' + createHash('sha256').update(identity).digest('hex').slice(0, 48)
+}
+
+/** 审核的 chat 请求按历史条目分段，并补固定缓存键。 */
+function rewriteOpenAIBody(body, identity) {
+  if (body === null || typeof body !== 'object' || !Array.isArray(body.messages)) return undefined
+  // 推理模型走 developer，其余走 system，两种都算策略消息。
+  const policy = body.messages.find(message => message?.role === 'system' || message?.role === 'developer')
+  const instructions = typeof policy?.content === 'string' ? policy.content : Array.isArray(policy?.content) ? policy.content.map(part => part?.text ?? '').join('\n') : undefined
+  if (typeof instructions !== 'string' || !instructions.includes(POLICY_HEAD) || !instructions.includes(POLICY_MARK)) return undefined
+  const index = body.messages.findIndex(message => message?.role === 'user')
+  if (index < 0) return undefined
+  const message = body.messages[index]
+  const review = reviewTextOf(message)
+  if (review === undefined) return undefined
+  const blocks = reviewBlocks(review.text)
+  if (blocks === undefined) return undefined
+  const shape = text => review.plain ? text : [{ type: 'text', text }]
+  const messages = body.messages.slice(0, index)
+    .concat(blocks.map(text => ({ ...message, content: shape(text) })))
+    .concat(body.messages.slice(index + 1))
+  const key = reviewCacheKey(identity)
+  return { ...body, messages, ...key === undefined ? {} : { prompt_cache_key: key } }
+}
+
+/** Responses 的输入由上游写边界，这里只补固定缓存键。 */
+function rewriteResponseBody(body, identity) {
+  if (body === null || typeof body !== 'object') return undefined
+  const instructions = typeof body.instructions === 'string' ? body.instructions : undefined
+  if (typeof instructions !== 'string' || !instructions.includes(POLICY_HEAD) || !instructions.includes(POLICY_MARK)) return undefined
+  const key = reviewCacheKey(identity)
+  if (key === undefined || body.prompt_cache_key === key) return undefined
+  return { ...body, prompt_cache_key: key }
+}
+
+/** 字符串正文直接改写，Request 只读副本。 */
+async function rewriteEndpoint(input, init, rewrite, path) {
+  try {
+    if (typeof init?.body === 'string') {
+      const raw = typeof input === 'string' || input instanceof URL ? String(input) : input?.url
+      if (new URL(raw).pathname !== path) return undefined
+      const body = rewrite(JSON.parse(init.body))
+      if (body === undefined) return undefined
+      const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
+      headers.delete('content-length')
+      return { init: { ...init, headers, body: JSON.stringify(body) } }
+    }
+    if (!(input instanceof Request) || init?.body !== undefined || input.bodyUsed) return undefined
+    if (new URL(input.url).pathname !== path) return undefined
+    if (init?.signal?.aborted || input.signal.aborted) return undefined
+    const body = rewrite(JSON.parse(await input.clone().text()))
+    if (body === undefined) return undefined
+    const headers = new Headers(input.headers)
+    headers.delete('content-length')
+    return { init: { ...init, headers, body: JSON.stringify(body) } }
+  } catch {
+    return undefined
+  }
+}
+
+/** 按端点分派审核改写，其他流量不解析正文。 */
+async function rewriteReviewRequest(input, init, checkpoints, identity) {
+  try {
+    const raw = typeof input === 'string' || input instanceof URL ? String(input) : input?.url
+    const path = new URL(raw).pathname
+    if (path === '/v1/messages') return rewriteAnthropicRequest(input, init, checkpoints, identity)
+    if (path === '/v1/chat/completions') return rewriteEndpoint(input, init, body => rewriteOpenAIBody(body, identity), path)
+    if (path === '/v1/responses') return rewriteEndpoint(input, init, body => rewriteResponseBody(body, identity), path)
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** 多个实例共用异步入口，外层仍引用时保留空调度器。 */
 function registerFetchHook(id, hook) {
   let registry = globalThis[FETCH_DISPATCHER]
@@ -469,7 +554,7 @@ export function apply(ctx, config) {
   }
 
   ctx.inject(['llm'], (scope) => {
-    const hookId = 'auto-review-cache-identity#anthropic-breakpoint#' + randomUUID()
+    const hookId = 'auto-review-cache-identity#review-cache#' + randomUUID()
     const checkpoints = new Map()
     const reviewContext = new AsyncLocalStorage()
     const disposeFetch = registerFetchHook(hookId, async (input, init) => {
@@ -477,11 +562,12 @@ export function apply(ctx, config) {
       if (context === undefined) return undefined
       const settings = readSettings()
       if (!settings.enabled) return undefined
-      const result = await rewriteAnthropicRequest(input, init, checkpoints, context.identity)
+      const result = await rewriteReviewRequest(input, init, checkpoints, context.identity)
       if (result !== undefined && settings.trace !== undefined) {
         try {
-          const content = JSON.parse(result.init.body).messages[0].content
-          appendFileSync(settings.trace, JSON.stringify({ at: new Date().toISOString(), event: 'anthropic-cache', transport: input instanceof Request ? 'request' : 'init', blocks: content.length, marks: content.filter(block => block.cache_control !== undefined).length }) + '\n')
+          const rewritten = JSON.parse(result.init.body)
+          const content = Array.isArray(rewritten.messages) ? rewritten.messages[0]?.content : undefined
+          appendFileSync(settings.trace, JSON.stringify({ at: new Date().toISOString(), event: 'review-cache', transport: input instanceof Request ? 'request' : 'init', messages: Array.isArray(rewritten.messages) ? rewritten.messages.length : 0, marks: Array.isArray(content) ? content.filter(block => block.cache_control !== undefined).length : 0, key: rewritten.prompt_cache_key !== undefined }) + '\n')
         } catch {}
       }
       return result
@@ -543,4 +629,4 @@ export function apply(ctx, config) {
 }
 
 /** 离线验证复用协议解析与拦截入口。 */
-export const _internal = { isReview, reviewText, reviewCwd, resolveIdentity, rewrite, plan, currentSessionId, routeOf, reviewRoute, settingsOf, SCOPES, loadSchemastery, configSchema, reviewBlocks, rewriteAnthropicBody, rewriteAnthropicFetch, rewriteAnthropicRequest, registerFetchHook, reviewStreamScope }
+export const _internal = { isReview, reviewText, reviewCwd, resolveIdentity, rewrite, plan, currentSessionId, routeOf, reviewRoute, settingsOf, SCOPES, loadSchemastery, configSchema, reviewBlocks, rewriteAnthropicBody, rewriteAnthropicFetch, rewriteAnthropicRequest, registerFetchHook, reviewStreamScope , rewriteOpenAIBody, rewriteResponseBody, rewriteReviewRequest }
