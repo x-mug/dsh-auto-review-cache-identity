@@ -2,37 +2,37 @@
 
 给内置 Auto 审查（`@deepseek-ai/dsh-experimental-auto-review`）的模型调用补一个稳定的缓存身份，让审查请求的 prompt 前缀能跨调用复用；同时可以在设置页里给审查单独指定一个模型。
 
-版本 **1.0.0**，插件包名为 `@x-mug/dsh-auto-review-cache-identity`。兼容基线为 **DeepSeek Harness Desktop 0.2.1-rc.3 / Cordis 4.0.5**。插件依赖 DSH 内部的服务钩子与客户端槽位，其他版本需要重新验证。
+版本 **1.1.1**，插件包名为 `@x-mug/dsh-auto-review-cache-identity`。兼容基线为 **DeepSeek Harness Desktop 0.2.1-rc.3 / Cordis 4.0.5**。插件依赖 DSH 内部的服务钩子与客户端槽位，其他版本需要重新验证。
 
 ## 为什么需要它
 
 Auto 预设下每个工具调用都要先过一次 LLM 审查。审查请求由 `classifyRisk` 构造，只有 `provider / model / system / messages / temperature / signal`，**没有 sessionId**。
 
-pi-ai 因此把 `prompt_cache_key` 发成 `undefined`，网关只能用"首条 user 消息"现算一个会话 id。审查的 system 是固定的 `REVIEW_POLICY`，但 user 消息每次都变，于是每轮都是新键、前缀从不复用——实测这批请求命中率约 10%，占 DSH 全部未命中的多数。
+缺少会话身份会影响网关的请求归组与路由。对 Anthropic 而言，还需要稳定的内容块边界和显式 `cache_control`；身份本身不能替代缓存断点。
 
-本插件在 `llm/stream` 上认出审查调用，补一个稳定的 `sessionId`；pi-ai 把它写进 `prompt_cache_key` 和会话头，缓存键不再随请求内容变化。
+本插件在 `llm/stream` 上补稳定的 `sessionId`。会话头插件使用这个身份；pi-ai 是否发送 `prompt_cache_key` 由所选 API 与兼容配置决定。原生 Anthropic 审核请求在发送前再补历史缓存断点。
 
 ## 功能
 
 - **稳定身份**：`"auto-review:" + sha256(会话 id)[:32]`，原始会话 id 不出现在请求里。
 - **可选固定审查模型**：设置页里选供应商与模型；留空跟随主对话。
-- **只动网络元数据**：`system / messages / temperature / signal` 及其余字段逐字节不变，新增的只有 `sessionId`。
-- **失败即放行**：插件内部任何异常都退回原始请求，最坏结果等于不装。
+- **Anthropic 历史缓存**：按历史条目分块，保留前一轮与当前轮的显式断点；完整文本、角色和顺序不变，待审动作不打标。
+- **异常回退原请求**：插件失败时仍执行原有审核，不改变审核的拒绝行为。
 - **设置页**：导出 schemastery `Config` 后自动生成表单；另有一个自定义分区「Auto 审查模型」，用实时模型目录做下拉。
 
 ## 安装
 
-本插件首次随仓库发布的版本是 `1.0.0`。安装方式与仓库其他插件一致：
+当前本地版本为 `1.1.1`，变更记录见 [CHANGELOG.md](./CHANGELOG.md)。安装方式与仓库其他插件一致；发布安装包需要单独发布版本：
 
 1. 在 DSH 插件页点击「添加插件」→「安装第三方插件」，填一段安装地址。
-2. 本插件对应 `local-dsh-auto-review-cache-identity-1.0.0.tgz`；已发布该版本时可直接填 Release 压缩包直链，或填仓库目录在本机的绝对路径。
-3. 按插件页提示重启或重载应用，确认插件版本为 1.0.0。
+2. 本插件对应 `local-dsh-auto-review-cache-identity-1.1.1.tgz`；已发布该版本时可直接填 Release 压缩包直链，或填仓库目录在本机的绝对路径。
+3. 按插件页提示重启或重载应用，确认插件版本为 1.1.1。
 4. 安装成功后，设置页会出现「Auto 审查模型」分区，并在插件配置表单里出现四个字段。
 
 多插件仓库用 `#path:` 指向子目录，例如版本 tag 发布后可以写：
 
 ```text
-github:x-mug/dsh-plugins#v1.0.0&path:/plugins/dsh-auto-review-cache-identity
+github:x-mug/dsh-plugins#v1.1.1&path:/plugins/dsh-auto-review-cache-identity
 ```
 
 只写仓库根地址不行：根目录不是插件包，管理器会拒绝并回滚。升级时先移除旧版本再安装。
@@ -68,7 +68,7 @@ bundle 默认值只有两项，其余都留给设置页或 profile 补丁：
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `log` | `false` | 每次注入打一行 info：`injected=<累计> key=<键> identityMisses=<累计>`。 |
-| `trace` | 不设 | 一个**本机绝对路径**。每次注入向该文件追加一行 JSON（时间、键、provider、model）。 |
+| `trace` | 不设 | 一个**本机绝对路径**。记录身份、路由、挂载和缓存断点的元数据，不记录正文或凭据。 |
 
 `trace` 不写进仓库默认值：绝对路径是某台机器的本地残留，装到别人机器上只会静默写失败。需要定位时在自己的 profile 补丁里显式给出路径，用完删掉。
 
@@ -87,16 +87,20 @@ bundle 默认值只有两项，其余都留给设置页或 profile 补丁：
 
 自定义分区下方有「设置原始信息」，展开是 `describe` 的原始返回，排查"保存了但没生效"时先看它。宿主没注册表单时，分区会直接把保存按钮置灰并提示原因，不再把失败伪装成「跟随主对话」。
 
-## 只动网络元数据
+## Anthropic 缓存断点
 
-- `system` / `messages` / `temperature` / `signal` 以及其余所有字段原样带走，逐字节不变。
-- 新增的只有 `sessionId`（它不进 prompt，只在适配器里翻成 `prompt_cache_key` 和两个请求头）。
-- 不改 `options` 本身。审查的 options 是 `deepFreeze`，本插件构造新对象并冻结。
-- 流是纯透传：不包装、不过滤、不重试、不补块、不聚合。
-- 非审查调用不吃包装：监听器直接返回 `next()`，调用方拿到的就是下游那个流对象本身。
-- 处理器是同步函数：返回 Promise 会让审查方的 `for await` 直接 TypeError。
-- 不缓存 `llm` 服务引用，每次调用都重新取，HMR 后不会走旧注册表。
-- 不持有 AbortController，卸载时不 abort 在飞的审查。
+审核供应商需选择原生 `anthropic-messages` 通道，例如本机 `magpie-anthropic`。Chat Completions 和 Responses 请求不经过此正文改写。
+
+- 使用独立的异步 fetch 调度器，支持普通参数和 desktop HTTP 跟踪器生成的 `Request`；请求正文只读副本，跟踪器照常工作。
+- 用异步作用域把缓存处理限制到内置审核流；普通模型请求不解析正文，会话头插件继续独立工作。
+- 在适配器完成序列化后，将 `FILTERED_HISTORY` 数组的每个顶层对象保留为独立 text block。所有块拼接后与原文本完全相同。
+- 缓存工程上下文与当前最后一条历史；同一身份追加历史时，也保留上一轮已校验的前缀断点。待审动作和数组结束符留在末尾普通块中。
+- 发送 `X-Magpie-Cache-Marks: client`，使用 Magpie 已有的客户端缓存标记能力，不修改 Magpie。
+- 只在内存中保存最近 256 个身份的断点索引与 SHA-256，不保存历史正文；卸载时清空。
+- 不改审核策略、角色、内容和顺序，不修改审查选项原对象，不重试请求，不改模型回复。
+- 默认沿用适配器的缓存 TTL，缺省为 `ephemeral`（5 分钟）。
+
+2026-11-03 经本机 Magpie 0.1.2838 → LiteLLM Haiku 的合成集成测试：首次写入 15,819 token；追加一条历史后读取 15,819 token，仅新增写入 34 token。1.1.0 的此项合成验证未覆盖 desktop 外层 HTTP 跟踪器。1.1.1 已补相同调用链的回归测试；本机 desktop 真实审核在 21:17:06 读取 166,894 token、写入 2,931 token、未缓存输入 3,874 token，读取占总输入约 96.08%。单笔结果不代表所有会话或账号的长期命中率。
 
 ## 失败即放行
 
@@ -146,14 +150,12 @@ ctx.get('agents')?.currentInitiator()?.session?.id
 
 ## 已知限制
 
-1. **分路由有效，这是最大的边界。** 只在 openai-responses 这类会发会话头的路由上有效；纯 chat/completions 路由上键虽然稳定，但请求被摊到不同账号，读不到别人的缓存，收益≈0。判断方法：看请求实际走的接口路径，上游段是 `/v1/responses` 才有效。不要因为"装上了"就以为有效。
-2. **固定审查模型是安全闸门上的配置。** Auto 审查要求模型按规定协议返回：恰好一个 text 块、合法 JSON、6 种判决形状之一。换成不遵守协议的模型后，审查会**失败并直接拒绝工具调用**（fail-closed：不弹审批、不转人工、不重试），表现为所有工具调用都报「Auto review of tool "X" failed」。设置固定模型前先用兼容模型验证，出问题就把两个字段清空、回落主对话。
-3. **`onPayload` 这条路已验证不可用，别重走。** pi-ai 三个适配器都支持它，但 `dsh-llm-pi-ai` 用白名单重建送给 pi-ai 的选项，`onPayload` 不在白名单里，从 `llm/stream` 上挂会被静默丢掉。唯一能从插件侧到达 `prompt_cache_key` 的字段是 `sessionId`。
-4. **`isAgentLoopRequest` 护栏未在真环境验证。** 它是模块级的 WeakSet：插件 `import '@deepseek-ai/dsh-llm'` 若解析到另一份模块副本，这个集合就是空的，护栏静默失效。两个方向都安全：误 false 只是少一道护栏；误 true 只是这一次不注入。
-5. **寄生依赖：键发不发得出去由 profile 决定。** `prompt_cache_key` 不是本插件凭空加的，pi-ai 还要满足自己的条件：responses 适配器要 `cacheRetention !== "none"`；completions 适配器只有 baseURL 命中 `api.openai.com` 或 `cacheRetention === "long"` 且 compat 支持时才发。换一台机器可能静默 no-op。
-6. **离线无法证明后端真的按这个键复用。** 验收要看 `cache_read` 是否真的增长，不能只看缓存命中率的小数点。
-7. **`scope: cwd` 不要长期开。** 同目录几十个会话会共用一个身份，这是稳定的错，账本上看不出来；它只用来做 A/B 对照。
-8. **插件不写任何持久状态**，卸载后不留残留；设置值留在 profile 的 `cordis.patch.yml` 里，需要时手动清。
+1. 缓存断点只作用于本插件识别的原生 Anthropic 审核流；不接管普通对话和其他 API。
+2. 审核模型仍须遵守内置判决协议，解析失败由内置审核拒绝；本插件不降低审核要求。
+3. `onPayload` 会被当前 DSH 适配器的选项白名单丢弃，因此缓存标记在最终 fetch 请求上添加。
+4. 缓存要求相同的前缀、兼容的缓存 TTL、有效期和上游缓存分区；切换账号、改写历史或过期仍可能未命中。
+5. `scope: cwd` 仅用于对照实验；长期使用应按会话区分身份。
+6. 设置页的 volatile 配置实时生效；代码和包版本的加载状态以 desktop 实际重载结果为准。
 
 ## 回退
 
@@ -176,7 +178,7 @@ node --check index.js
 node --check client.js
 ```
 
-离线测试用迷你 cordis 复刻 waterfall 语义、真实 AsyncLocalStorage 模拟发起者作用域，覆盖审查识别、身份推导、并发不串号、volatile 配置解引用、运行期改设置、失败放行、卸载恢复，共 23 项。自动化测试不代表真实 GUI 验收；设置分区、下拉框和保存按钮还需要在应用里点一遍。
+离线测试用迷你 cordis 复刻 waterfall 语义、真实 AsyncLocalStorage 模拟发起者作用域，覆盖审查识别、身份推导、并发不串号、volatile 配置解引用、运行期改设置、失败放行、卸载恢复，覆盖缓存前缀、并发身份和共享钩子的回归项。自动化测试不代表真实 GUI 验收；设置分区、下拉框和保存按钮还需要在应用里点一遍。
 
 客户端部分不需要构建：`client.js` 是手写的 `window.__ModuleLoader__.load({ id, factory })` 工厂函数，React 由 loader 注入，直接 `require('react')`。宿主部分（`index.js`）只读配置、挂 `llm/stream`，没有编译产物。
 
