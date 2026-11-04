@@ -2,7 +2,7 @@
 
 给内置 Auto 审查（`@deepseek-ai/dsh-experimental-auto-review`）的模型调用补一个稳定的缓存身份，让审查请求的 prompt 前缀能跨调用复用；同时可以在设置页里给审查单独指定一个模型。
 
-版本 **1.1.1**，插件包名为 `@x-mug/dsh-auto-review-cache-identity`。兼容基线为 **DeepSeek Harness Desktop 0.2.1-rc.3 / Cordis 4.0.5**。插件依赖 DSH 内部的服务钩子与客户端槽位，其他版本需要重新验证。
+版本 **1.1.2**，插件包名为 `@x-mug/dsh-auto-review-cache-identity`。兼容基线为 **DeepSeek Harness Desktop 0.2.1-rc.5 / Cordis 4.0.5**。插件依赖 DSH 内部的服务钩子与客户端槽位，其他版本需要重新验证。
 
 ## 为什么需要它
 
@@ -76,9 +76,9 @@ bundle 默认值只有两项，其余都留给设置页或 profile 补丁：
 
 1. 设置页保存只写 volatile 字段，**不会重新 apply 插件**。插件每次处理审查时现读配置，所以保存后立即生效、无需重启。
 2. 写入是 CAS：客户端用读到的 revision 提交，过期会被拒绝并提示保存失败，重新打开设置页再存即可。
-3. **本地 link 安装时，宿主的包要靠 `peerDependencies` 借。** 插件是按包名 `import('@deepseek-ai/schemastery')` 的；DSH 的本地目录安装走 `link:`，插件真实路径在 profile 之外、祖先目录没有 `node_modules`，宿主只对"插件 manifest 的 `peerDependencies` 里点过名"的包开转发通道（`dsh-app-boot` 的 `routeLinked`）。漏声明时 `Config` 静默变成 `undefined`——两个下拉永远显示「跟随主对话」、点保存报 `No configurable plugin entry`，而 profile 补丁里的值其实是对的。本插件已声明 `@deepseek-ai/schemastery` 与 `@deepseek-ai/dsh-llm`（都标 `optional`，宿主的包不在 registry 上）；挂载日志里的 `form=on|off` 是这条链路的判据。
+3. **表单依赖随插件安装。** `@deepseek-ai/schemastery` 是必装依赖，本地 link 源码目录也需要安装依赖。缺少依赖时插件加载会明确报错，不再静默丢失表单。
 
-自定义分区下方有「设置原始信息」，展开是 `describe` 的原始返回，排查"保存了但没生效"时先看它。宿主没注册表单时，分区会直接把保存按钮置灰并提示原因，不再把失败伪装成「跟随主对话」。
+自定义分区下方有「原始信息」，展开可查看宿主提供的表单状态。宿主没有注册表单、配置不可读或不可写时，下拉和保存按钮会禁用，不把读取失败伪装成「跟随主对话」。
 
 ## Anthropic 缓存断点
 

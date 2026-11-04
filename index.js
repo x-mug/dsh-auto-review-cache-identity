@@ -2,6 +2,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { appendFileSync } from 'node:fs'
+import Schema from '@deepseek-ai/schemastery'
 
 /** Cordis 插件名，bundle patch 用同一个 id 挂载。 */
 export const name = 'auto-review-cache-identity'
@@ -9,28 +10,21 @@ export const name = 'auto-review-cache-identity'
 /** 没有硬依赖：agents / llm / settings 都按可选服务访问。 */
 export const inject = []
 
-/** 设置页表单的字段定义；取不到 schemastery 时不导出，插件照常工作，只是没有表单。 */
+/** 表单依赖随插件安装，加载失败时由宿主报告原始错误。 */
 export const Config = await configSchema()
 
-/** 取 schemastery；链接安装时宿主按 package.json 的 peerDependencies 把这份依赖借给插件。 */
-async function loadSchemastery() {
-  const { default: z } = await import('@deepseek-ai/schemastery')
-  return z
-}
+/** 配置表单使用插件自己的必装依赖。 */
+async function loadSchemastery() { return Schema }
 
-/** 声明设置页字段；load 可注入，测试不碰真实解析。 */
+/** 声明设置页字段，并保留可注入的离线验证入口。 */
 async function configSchema(load = loadSchemastery) {
-  try {
-    const z = await load()
-    return z === undefined ? undefined : z.object({
-      enabled: z.boolean().default(true).volatile().description('给 Auto 审查补稳定缓存身份'),
-      scope: z.union(['session', 'cwd']).default('session').volatile().description('缓存身份按会话还是按工作目录'),
-      reviewProvider: z.string().default('').volatile().description('Auto 审查固定使用的供应商，留空跟随主对话'),
-      reviewModel: z.string().default('').volatile().description('Auto 审查固定使用的模型 id，留空跟随主对话')
-    })
-  } catch {
-    return undefined
-  }
+  const z = await load()
+  return z.object({
+    enabled: z.boolean().default(true).volatile().description('给 Auto 审查补稳定缓存身份'),
+    scope: z.union(['session', 'cwd']).default('session').volatile().description('缓存身份按会话还是按工作目录'),
+    reviewProvider: z.string().default('').volatile().description('Auto 审查固定使用的供应商，留空跟随主对话'),
+    reviewModel: z.string().default('').volatile().description('Auto 审查固定使用的模型 id，留空跟随主对话')
+  })
 }
 
 /** 审查策略的固定首行。 */

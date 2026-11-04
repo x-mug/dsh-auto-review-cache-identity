@@ -1,6 +1,6 @@
 {
   "name": "@x-mug/dsh-auto-review-cache-identity",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "private": true,
   "repository": {
     "type": "git",
@@ -10,14 +10,10 @@
   "description": "Stable auto-review identity and native Anthropic cache breakpoints, including Desktop Request transport.",
   "peerDependencies": {
     "@deepseek-ai/dsh-llm": "*",
-    "@deepseek-ai/schemastery": "*",
     "dsh-session-header": "*"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-llm": {
-      "optional": true
-    },
-    "@deepseek-ai/schemastery": {
       "optional": true
     },
     "dsh-session-header": {
@@ -55,5 +51,8 @@
         "@deepseek-ai/dsh-client-ui-settings"
       ]
     }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.5"
   }
 }

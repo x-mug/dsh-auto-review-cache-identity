@@ -12,5 +12,12 @@
   "saved": "已保存",
   "raw": "原始信息",
   "readFailed": "读取失败：{message}",
-  "saveFailed": "保存失败：{message}"
+  "saveFailed": "保存失败：{message}",
+  "sectionTitle": "Auto 审查模型",
+  "loading": "正在读取配置…",
+  "unavailable": "配置不可用",
+  "readOnly": "配置为只读",
+  "saving": "正在保存…",
+  "saveRejected": "宿主拒绝了改动。",
+  "catalogRejected": "宿主拒绝了模型目录请求。"
 }

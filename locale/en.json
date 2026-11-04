@@ -12,5 +12,12 @@
   "saved": "Saved",
   "raw": "Raw details",
   "readFailed": "Read failed: {message}",
-  "saveFailed": "Save failed: {message}"
+  "saveFailed": "Save failed: {message}",
+  "sectionTitle": "Auto review model",
+  "loading": "Loading configuration…",
+  "unavailable": "Configuration unavailable",
+  "readOnly": "Configuration is read-only",
+  "saving": "Saving…",
+  "saveRejected": "The host rejected the changes.",
+  "catalogRejected": "The host rejected the model catalog request."
 }

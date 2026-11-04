@@ -529,17 +529,23 @@ test('cache hooks use a separate async registry and dispose only their own regis
 
 const { configSchema } = _internal;
 
-test('the manifest declares the host peers that unlock linked-install resolution', () => {
-  // 宿主按 peerDependencies 名单把安装里的包借给链接安装的插件。
+test('packaging installs the form schema and keeps only host services optional', () => {
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-  for (const name of ['@deepseek-ai/schemastery', '@deepseek-ai/dsh-llm', 'dsh-session-header']) {
+  assert.equal(manifest.dependencies?.['@deepseek-ai/schemastery'], '~3.18.5');
+  assert.equal(manifest.peerDependenciesMeta?.['@deepseek-ai/schemastery'], undefined);
+  for (const name of ['@deepseek-ai/dsh-llm', 'dsh-session-header']) {
     assert.equal(manifest.peerDependencies?.[name], '*');
-    // 声明成 optional，安装时不会去 registry 找宿主的包。
     assert.equal(manifest.peerDependenciesMeta?.[name]?.optional, true);
   }
 });
 
-test('configSchema builds the four volatile fields and never throws', async () => {
+test('the installed plugin exports a real editable settings schema', () => {
+  assert.equal(plugin.Config.type, 'object');
+  assert.deepEqual(Object.keys(plugin.Config.dict), ['enabled', 'scope', 'reviewProvider', 'reviewModel']);
+  for (const field of Object.values(plugin.Config.dict)) assert.equal(field.meta.volatile, true);
+});
+
+test('configSchema builds the four volatile fields', async () => {
   const calls = [];
   const chain = (kind) => {
     const field = {
@@ -565,7 +571,7 @@ test('configSchema builds the four volatile fields and never throws', async () =
   assert.equal(schema.dict.reviewModel.volatileFlag, true);
 });
 
-test('a schemastery the host does not lend leaves the plugin without a form', async () => {
-  assert.equal(await configSchema(async () => undefined), undefined);
-  assert.equal(await configSchema(async () => { throw new Error('no schemastery') }), undefined);
+test('schema loading preserves the dependency error instead of hiding the form', async () => {
+  const error = new Error('schema dependency unavailable');
+  await assert.rejects(configSchema(async () => { throw error }), actual => actual === error);
 });
