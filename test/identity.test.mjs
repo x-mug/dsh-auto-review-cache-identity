@@ -1,5 +1,5 @@
 // 离线自检：不起 DSH、不进网络，只验识别、身份来源、同步性、配置读取与失败放行。
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs';
 import * as plugin from '../index.js';
 
 const { apply: pluginApply, _internal } = plugin;
-const { isReview, resolveIdentity, plan, currentSessionId, settingsOf, SCOPES } = _internal;
+const { isReview, resolveIdentity, plan, currentSessionId, settingsOf, SCOPES, rewriteAnthropicBody, rewriteAnthropicFetch } = _internal;
 
 const POLICY = [
   'REVIEW_POLICY',
@@ -18,11 +18,11 @@ const POLICY = [
 const json = (value) => JSON.stringify(value, null, 2);
 
 /** 复刻 reviewUserText：四段用两个换行拼接。 */
-function reviewText(cwd, action) {
+function reviewText(cwd, action, history = []) {
   return [
     'ENVIRONMENT', json({ cwd }),
     'PROJECT_INSTRUCTIONS', json([]),
-    'FILTERED_HISTORY', json([]),
+    'FILTERED_HISTORY', json(history),
     'PENDING_ACTION', json(action)
   ].join('\n\n');
 }
@@ -119,11 +119,13 @@ function runtime({ adapter, agents = true }) {
       };
       callback(scope);
       collector = undefined;
-      return {
+      const handle = {
         dispose() {
           for (const dispose of disposers.splice(0).reverse()) dispose();
         }
       };
+      mountedHandles.push(handle);
+      return handle;
     },
     runAs(agent, operation) {
       return initiators.run(agent, operation);
@@ -143,6 +145,9 @@ async function readDecision(stream) {
   }
   return JSON.parse(text);
 }
+
+const mountedHandles = [];
+afterEach(() => { for (const handle of mountedHandles.splice(0)) handle.dispose(); });
 
 /** 造一个插件已加载的 runtime，并留下注入用的观测点。 */
 function mounted(settings = { enabled: true, scope: 'session', log: false }) {
@@ -411,6 +416,115 @@ test('disposing the plugin removes the listener', async () => {
   assert.equal(off.seen[0].sessionId, undefined);
 });
 
+// ---- Anthropic 原生请求的缓存断点 ----
+
+function anthropicReviewBody(action = { name: 'read', arguments: '{}' }, history = []) {
+  return {
+    model: 'claude-haiku-5-5',
+    system: [{ type: 'text', text: POLICY, cache_control: { type: 'ephemeral' } }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: reviewText('C:/work/a', action, history), cache_control: { type: 'ephemeral', ttl: '1h' } }] }]
+  };
+}
+
+test('anthropic review preserves text and caches complete history entries', () => {
+  const original = anthropicReviewBody(undefined, [{ text: 'nested "]} and emoji 😀', data: [{ done: true }] }, { text: 'next' }]);
+  const snapshot = JSON.stringify(original);
+  const content = rewriteAnthropicBody(original).messages[0].content;
+  assert.equal(content.length, 4);
+  assert.deepEqual(content[0].cache_control, { type: 'ephemeral', ttl: '1h' });
+  assert.deepEqual(content[2].cache_control, content[0].cache_control);
+  assert.equal(content[3].cache_control, undefined);
+  assert.equal(content.map(block => block.text).join(''), original.messages[0].content[0].text);
+  assert.match(content[0].text, /FILTERED_HISTORY/);
+  assert.match(content[3].text, /PENDING_ACTION/);
+  assert.equal(JSON.stringify(original), snapshot);
+});
+
+test('appending history preserves the previously cached prefix boundary', () => {
+  const first = { type: 'tool', result: { text: 'unchanged' } };
+  const a = rewriteAnthropicBody(anthropicReviewBody(undefined, [first])).messages[0].content;
+  const b = rewriteAnthropicBody(anthropicReviewBody({ name: 'write' }, [first, { type: 'tool', result: 'new' }])).messages[0].content;
+  assert.deepEqual(a.slice(0, -1).map(block => block.text), b.slice(0, a.length - 1).map(block => block.text));
+  assert.ok(a[a.length - 2].cache_control);
+  assert.ok(b[b.length - 2].cache_control);
+  assert.equal(b[b.length - 1].cache_control, undefined);
+});
+
+test('empty history and string content retain the complete reviewer input', () => {
+  const original = anthropicReviewBody();
+  original.system = POLICY;
+  original.messages[0].content = original.messages[0].content[0].text;
+  const content = rewriteAnthropicBody(original).messages[0].content;
+  assert.equal(content.length, 2);
+  assert.equal(content.map(block => block.text).join(''), original.messages[0].content);
+  assert.deepEqual(content[0].cache_control, { type: 'ephemeral' });
+  assert.equal(content[1].cache_control, undefined);
+});
+
+test('anthropic rewrite ignores non-review and already split requests', () => {
+  assert.equal(rewriteAnthropicBody({ system: 'ordinary', messages: [] }), undefined);
+  const split = rewriteAnthropicBody(anthropicReviewBody());
+  assert.equal(rewriteAnthropicBody(split), undefined);
+});
+
+test('anthropic fetch hook rewrites only messages JSON with a string body', () => {
+  const body = anthropicReviewBody();
+  const next = rewriteAnthropicFetch('http://127.0.0.1:3425/v1/messages', { body: JSON.stringify(body), headers: { x: 'y' } });
+  assert.equal(next.init.headers.get('x'), 'y');
+  assert.equal(next.init.headers.get('x-magpie-cache-marks'), 'client');
+  assert.equal(JSON.parse(next.init.body).messages[0].content.length, 2);
+  assert.equal(rewriteAnthropicFetch('http://127.0.0.1:3425/v1/chat/completions', { body: JSON.stringify(body) }), undefined);
+  assert.equal(rewriteAnthropicFetch('http://127.0.0.1:3425/v1/messages', {}), undefined);
+  assert.equal(rewriteAnthropicFetch('http://127.0.0.1:3425/v1/messages', { body: '{bad' }), undefined);
+});
+
+test('previous checkpoint survives several appended history entries', () => {
+  const checkpoints = new Map();
+  const url = 'http://127.0.0.1:3425/v1/messages';
+  const send = history => JSON.parse(rewriteAnthropicFetch(url, { headers: { 'x-session-id': 'review-a' }, body: JSON.stringify(anthropicReviewBody(undefined, history)) }, checkpoints).init.body).messages[0].content;
+  send([{ text: 'old' }]);
+  const content = send([{ text: 'old' }, { text: 'new-a' }, { text: 'new-b' }]);
+  assert.ok(content[1].cache_control);
+  assert.ok(content[3].cache_control);
+  assert.equal(content[4].cache_control, undefined);
+  assert.equal(content.filter(block => block.cache_control).length, 3);
+  assert.deepEqual(Object.keys([...checkpoints.values()][0]).sort(), ['hash', 'index']);
+});
+
+test('a changed historical prefix never reuses a previous checkpoint', () => {
+  const checkpoints = new Map();
+  const url = 'http://127.0.0.1:3425/v1/messages';
+  const rewrite = history => JSON.parse(rewriteAnthropicFetch(url, { headers: { 'x-session-id': 'review-a' }, body: JSON.stringify(anthropicReviewBody(undefined, history)) }, checkpoints).init.body);
+  rewrite([{ text: 'old' }]);
+  const body = rewrite([{ text: 'changed' }, { text: 'new-a' }, { text: 'new-b' }]);
+  assert.equal(body.messages[0].content[1].cache_control, undefined);
+});
+
+test('cache hooks use a separate async registry and dispose only their own registration', () => {
+  const key = Symbol.for('auto-review-cache-identity#fetch-dispatcher@1');
+  const headerKey = Symbol.for('dsh-session-header#fetch-dispatcher@1');
+  const previous = globalThis[headerKey];
+  const originalFetch = globalThis.fetch;
+  const hooks = new Map([['session-header', () => undefined]]);
+  globalThis[headerKey] = { hooks, dispatcher: originalFetch };
+  const a = mounted();
+  const b = mounted();
+  try {
+    assert.equal(hooks.size, 1);
+    assert.equal(globalThis[key].hooks.size, 2);
+    assert.equal(globalThis.fetch, globalThis[key].dispatcher);
+    for (const handle of a.handles) handle.dispose();
+    assert.equal(globalThis[key].hooks.size, 1);
+    for (const handle of b.handles) handle.dispose();
+    assert.equal(globalThis[key], undefined);
+    assert.equal(globalThis.fetch, originalFetch);
+  } finally {
+    for (const handle of [...a.handles, ...b.handles]) handle.dispose();
+    if (previous === undefined) delete globalThis[headerKey];
+    else globalThis[headerKey] = previous;
+  }
+});
+
 // ---- 设置表单的 schema 来源 ----
 
 const { configSchema } = _internal;
@@ -418,7 +532,7 @@ const { configSchema } = _internal;
 test('the manifest declares the host peers that unlock linked-install resolution', () => {
   // 宿主按 peerDependencies 名单把安装里的包借给链接安装的插件。
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-  for (const name of ['@deepseek-ai/schemastery', '@deepseek-ai/dsh-llm']) {
+  for (const name of ['@deepseek-ai/schemastery', '@deepseek-ai/dsh-llm', 'dsh-session-header']) {
     assert.equal(manifest.peerDependencies?.[name], '*');
     // 声明成 optional，安装时不会去 registry 找宿主的包。
     assert.equal(manifest.peerDependenciesMeta?.[name]?.optional, true);

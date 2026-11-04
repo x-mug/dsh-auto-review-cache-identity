@@ -1,19 +1,6 @@
-/**
- * 给内置 Auto 审查的模型调用补一个稳定缓存身份。
- *
- * @deepseek-ai/dsh-experimental-auto-review 的 classifyRisk 造请求时只给
- * provider/model/system/messages/temperature/signal，没有 sessionId，
- * pi-ai 因此把 prompt_cache_key 发成 undefined，缓存键每轮都变。
- *
- * 会话身份直接读 DSH 自己的 initiator 作用域：
- * 审查发生在工具调用链里，agents.currentInitiator() 就是 exec.agent。
- * 读不到就不注入，原样放过。
- *
- * 只加 sessionId 一个字段，system/messages/temperature 与其余字段逐字节不变。
- *
- * @module @x-mug/dsh-auto-review-cache-identity
- */
-import { createHash } from 'node:crypto'
+/** 为内置审核补稳定身份，并保留原生 Anthropic 请求的历史缓存边界。 */
+import { createHash, randomUUID } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { appendFileSync } from 'node:fs'
 
 /** Cordis 插件名，bundle patch 用同一个 id 挂载。 */
@@ -70,6 +57,168 @@ try {
   isAgentLoopRequest = typeof llm.isAgentLoopRequest === 'function' ? llm.isAgentLoopRequest : undefined
 } catch {
   isAgentLoopRequest = undefined
+}
+
+// 异步调度器保留外层跟踪器，并等待审核请求副本的读取。
+const FETCH_DISPATCHER = Symbol.for('auto-review-cache-identity#fetch-dispatcher@1')
+
+/** 历史条目的块边界不会随下一条追加而变化。 */
+function reviewBlocks(text) {
+  const marker = '\n\nFILTERED_HISTORY\n\n'
+  const start = text.indexOf(marker) + marker.length
+  const action = text.lastIndexOf(ACTION_SECTION)
+  if (start < marker.length || action < start) return undefined
+  const raw = text.slice(start, action)
+  const history = JSON.parse(raw)
+  if (!Array.isArray(history) || history.some(item => item === null || typeof item !== 'object' || Array.isArray(item))) return undefined
+  const ends = []
+  let depth = 0
+  let quoted = false
+  let escaped = false
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i]
+    if (quoted) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') quoted = false
+      continue
+    }
+    if (ch === '"') quoted = true
+    else if (ch === '[' || ch === '{') depth += 1
+    else if (ch === ']' || ch === '}') {
+      depth -= 1
+      if (ch === '}' && depth === 1) ends.push(start + i + 1)
+    }
+  }
+  if (ends.length !== history.length) return undefined
+  const blocks = [text.slice(0, start + 1)]
+  let from = start + 1
+  for (const end of ends) {
+    blocks.push(text.slice(from, end))
+    from = end
+  }
+  blocks.push(text.slice(from))
+  return blocks
+}
+
+/** 缓存工程上下文和最后一条历史，待审动作保持为普通用户内容。 */
+function rewriteAnthropicBody(body) {
+  if (body === null || typeof body !== 'object' || !Array.isArray(body.messages) || body.messages.length !== 1) return undefined
+  const system = typeof body.system === 'string' ? body.system : Array.isArray(body.system) ? body.system.map(block => block.text ?? '').join('\n') : undefined
+  if (typeof system !== 'string' || !system.includes(POLICY_HEAD) || !system.includes(POLICY_MARK)) return undefined
+  const message = body.messages[0]
+  if (message?.role !== 'user') return undefined
+  const content = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content
+  if (!Array.isArray(content) || content.length !== 1 || content[0]?.type !== 'text') return undefined
+  const block = content[0]
+  if (typeof block.text !== 'string' || !block.text.startsWith(ENVIRONMENT_HEAD) || !block.text.includes(PROJECT_SECTION)) return undefined
+  const texts = reviewBlocks(block.text)
+  if (texts === undefined) return undefined
+  const { cache_control: cacheControl = { type: 'ephemeral' }, ...plain } = block
+  const blocks = texts.map(text => ({ ...plain, text }))
+  blocks[0].cache_control = cacheControl
+  if (blocks.length > 2) blocks[blocks.length - 2].cache_control = cacheControl
+  return { ...body, messages: [{ ...message, content: blocks }] }
+}
+
+/** 只改写发往 Messages 端点的审核 JSON，其他流量不解析正文。 */
+function rewriteAnthropicFetch(input, init, checkpoints, contextIdentity) {
+  try {
+    if (typeof init?.body !== 'string') return undefined
+    const raw = typeof input === 'string' || input instanceof URL ? String(input) : input.url
+    if (new URL(raw).pathname !== '/v1/messages') return undefined
+    const body = rewriteAnthropicBody(JSON.parse(init.body))
+    if (body === undefined) return undefined
+    const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
+    const identity = contextIdentity ?? headers.get('x-session-id') ?? body.metadata?.user_id
+    if (checkpoints !== undefined && typeof identity === 'string' && identity !== '') {
+      const key = body.model + ':' + identity
+      const blocks = body.messages[0].content
+      const last = blocks.length - 2
+      const previous = checkpoints.get(key)
+      const prefixHash = index => {
+        const hash = createHash('sha256').update(JSON.stringify(body.system))
+        for (let i = 0; i <= index; i += 1) hash.update(blocks[i].text)
+        return hash.digest('hex')
+      }
+      if (previous !== undefined && previous.index > 0 && previous.index < last && prefixHash(previous.index) === previous.hash) {
+        blocks[previous.index].cache_control = blocks[last].cache_control
+        const systemMarks = Array.isArray(body.system) ? body.system.filter(block => block.cache_control !== undefined).length : 0
+        if (systemMarks + blocks.filter(block => block.cache_control !== undefined).length > 4) delete blocks[0].cache_control
+      }
+      checkpoints.delete(key)
+      checkpoints.set(key, { index: last, hash: prefixHash(last) })
+      if (checkpoints.size > 256) checkpoints.delete(checkpoints.keys().next().value)
+    }
+    headers.set('X-Magpie-Cache-Marks', 'client')
+    headers.delete('content-length')
+    return { init: { ...init, headers, body: JSON.stringify(body) } }
+  } catch {
+    return undefined
+  }
+}
+
+/** HTTP 跟踪器会合并参数，正文只读取 Request 的副本。 */
+async function rewriteAnthropicRequest(input, init, checkpoints, identity) {
+  try {
+    if (typeof init?.body === 'string') return rewriteAnthropicFetch(input, init, checkpoints, identity)
+    if (!(input instanceof Request) || init?.body !== undefined || input.bodyUsed) return undefined
+    if (new URL(input.url).pathname !== '/v1/messages') return undefined
+    if (init?.signal?.aborted || input.signal.aborted) return undefined
+    const body = await input.clone().text()
+    return rewriteAnthropicFetch(input, { ...init, body }, checkpoints, identity)
+  } catch {
+    return undefined
+  }
+}
+
+/** 多个实例共用异步入口，外层仍引用时保留空调度器。 */
+function registerFetchHook(id, hook) {
+  let registry = globalThis[FETCH_DISPATCHER]
+  if (registry === undefined) {
+    const original = globalThis.fetch
+    const hooks = new Map()
+    const dispatcher = async (input, init) => {
+      let currentInput = input
+      let currentInit = init
+      for (const registered of hooks.values()) {
+        let next
+        try {
+          next = await registered(currentInput, currentInit)
+        } catch {
+          continue
+        }
+        if (next !== null && typeof next === 'object') {
+          if ('input' in next) currentInput = next.input
+          if ('init' in next) currentInit = next.init
+        }
+      }
+      return Reflect.apply(original, globalThis, [currentInput, currentInit])
+    }
+    registry = { original, dispatcher, hooks }
+    globalThis[FETCH_DISPATCHER] = registry
+    globalThis.fetch = dispatcher
+  }
+  registry.hooks.set(id, hook)
+  return () => {
+    registry.hooks.delete(id)
+    if (registry.hooks.size === 0 && globalThis.fetch === registry.dispatcher) {
+      globalThis.fetch = registry.original
+      delete globalThis[FETCH_DISPATCHER]
+    }
+  }
+}
+
+/** 审核流的每次推进和取消都携带同一身份。 */
+function reviewStreamScope(stream, storage, identity) {
+  const context = { identity }
+  const iterator = storage.run(context, () => stream[Symbol.asyncIterator]())
+  return {
+    [Symbol.asyncIterator]() { return this },
+    next(value) { return storage.run(context, () => iterator.next(value)) },
+    return(value) { return storage.run(context, () => iterator.return?.(value) ?? Promise.resolve({ value, done: true })) },
+    throw(error) { return storage.run(context, () => iterator.throw?.(error) ?? Promise.reject(error)) }
+  }
 }
 
 /**
@@ -289,6 +438,11 @@ export function apply(ctx, config) {
   // 设置页改值走运行期写引用，不重启也不重新 apply，必须每次现读。
   const readSettings = () => settingsOf(config)
   const initial = readSettings()
+  if (initial.trace !== undefined) {
+    try {
+      appendFileSync(initial.trace, JSON.stringify({ at: new Date().toISOString(), event: 'mounted', transport: 'async-fetch' }) + '\n')
+    } catch {}
+  }
   if (SCOPES[initial.scope] === undefined) {
     ctx.logger?.warn(`[auto-review-cache-identity] unknown scope "${initial.scope}"; injection stays off`)
     return
@@ -321,6 +475,28 @@ export function apply(ctx, config) {
   }
 
   ctx.inject(['llm'], (scope) => {
+    const hookId = 'auto-review-cache-identity#anthropic-breakpoint#' + randomUUID()
+    const checkpoints = new Map()
+    const reviewContext = new AsyncLocalStorage()
+    const disposeFetch = registerFetchHook(hookId, async (input, init) => {
+      const context = reviewContext.getStore()
+      if (context === undefined) return undefined
+      const settings = readSettings()
+      if (!settings.enabled) return undefined
+      const result = await rewriteAnthropicRequest(input, init, checkpoints, context.identity)
+      if (result !== undefined && settings.trace !== undefined) {
+        try {
+          const content = JSON.parse(result.init.body).messages[0].content
+          appendFileSync(settings.trace, JSON.stringify({ at: new Date().toISOString(), event: 'anthropic-cache', transport: input instanceof Request ? 'request' : 'init', blocks: content.length, marks: content.filter(block => block.cache_control !== undefined).length }) + '\n')
+        } catch {}
+      }
+      return result
+    })
+    scope.effect(() => () => {
+      disposeFetch()
+      checkpoints.clear()
+      reviewContext.disable()
+    })
     // 处理器必须同步返回流：返回 Promise 会让调用方直接 TypeError。
     scope.on('llm/stream', (options, next) => {
       // 只有确认是审查才去读发起者会话，主对话、压缩、标题不付这个开销。
@@ -347,7 +523,7 @@ export function apply(ctx, config) {
       // next() 靠 cbs.shift() 前进，任何路径都只能调一次；重放会跳过后续监听器。
       let stream
       try {
-        stream = scope.llm.stream(call)
+        stream = reviewStreamScope(scope.llm.stream(call), reviewContext, call.sessionId)
       } catch {
         return next()
       }
@@ -372,5 +548,5 @@ export function apply(ctx, config) {
   })
 }
 
-/** 纯函数导出，离线验证台直接用。 */
-export const _internal = { isReview, reviewText, reviewCwd, resolveIdentity, rewrite, plan, currentSessionId, routeOf, reviewRoute, settingsOf, SCOPES, loadSchemastery, configSchema }
+/** 离线验证复用协议解析与拦截入口。 */
+export const _internal = { isReview, reviewText, reviewCwd, resolveIdentity, rewrite, plan, currentSessionId, routeOf, reviewRoute, settingsOf, SCOPES, loadSchemastery, configSchema, reviewBlocks, rewriteAnthropicBody, rewriteAnthropicFetch, rewriteAnthropicRequest, registerFetchHook, reviewStreamScope }
