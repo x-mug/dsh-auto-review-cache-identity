@@ -22,20 +22,13 @@ Auto 预设下每个工具调用都要先过一次 LLM 审查。审查请求由 
 
 ## 安装
 
-当前本地版本为 `1.1.1`，变更记录见 [CHANGELOG.md](./CHANGELOG.md)。安装方式与仓库其他插件一致；发布安装包需要单独发布版本：
-
-1. 在 DSH 插件页点击「添加插件」→「安装第三方插件」，填一段安装地址。
-2. 本插件对应 `local-dsh-auto-review-cache-identity-1.1.1.tgz`；已发布该版本时可直接填 Release 压缩包直链，或填仓库目录在本机的绝对路径。
-3. 按插件页提示重启或重载应用，确认插件版本为 1.1.1。
-4. 安装成功后，设置页会出现「Auto 审查模型」分区，并在插件配置表单里出现四个字段。
-
-多插件仓库用 `#path:` 指向子目录，例如版本 tag 发布后可以写：
+在 DSH 的「插件 → 添加插件 → 安装第三方插件」中输入：
 
 ```text
-github:x-mug/dsh-plugins#v1.1.1&path:/plugins/dsh-auto-review-cache-identity
+github:x-mug/dsh-auto-review-cache-identity
 ```
 
-只写仓库根地址不行：根目录不是插件包，管理器会拒绝并回滚。升级时先移除旧版本再安装。
+本仓库根目录就是插件包；也可使用本机源码目录，或使用已发布版本的 Release 压缩包。安装后按提示重启或重载，并在设置页确认「Auto 审查模型」分区。固定版本可在版本 tag 发布后使用 `github:x-mug/dsh-auto-review-cache-identity#v<版本>`。升级时先移除旧版本，再安装新版本。变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ## 配置
 
