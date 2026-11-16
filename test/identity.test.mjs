@@ -368,25 +368,49 @@ test('the cwd scope reads the single-line environment of a new-style review', ()
   assert.equal(planned.identity, identityOf('C:/work/new'));
 });
 
-test('a new-style review reaches the adapter on the configured review route', async () => {
-  const a = mounted({ enabled: true, scope: 'session', log: false, review: { provider: 'magpie', model: 'group/fastlight' } });
-  const modern = {
+/** 复刻新版 classifyRisk：purpose 标记加多条历史消息。 */
+function modernReviewCall(overrides = {}) {
+  const { provider, model, ...rest } = overrides;
+  return {
     ...reviewCall('C:/work/a'),
-    provider: 'magpie',
-    model: 'group/smartworker',
+    provider: provider ?? 'magpie',
+    model: model ?? 'group/smartworker',
     purpose: 'auto-review',
     sessionId: 'main-session-abc',
     messages: [
       { role: 'user', content: [{ type: 'text', text: 'ENVIRONMENT\n{"cwd":"C:/work/a"}' }] },
       { role: 'user', content: [{ type: 'text', text: '{"kind":"user-message"}' }] }
-    ]
+    ],
+    ...rest
   };
-  const verdict = await a.ctx.runAs({ session: { id: 'session-abc' } }, () => readDecision(a.ctx.llm.stream(modern)));
+}
+
+test('a new-style review reaches the adapter on whatever route the settings hold', async () => {
+  // 路由来自设置，不写死某个模型名。
+  const config = { enabled: true, scope: 'session', log: false, reviewProvider: 'magpie-anthropic', reviewModel: 'litellm-hypergryph/claude-haiku-5-5' };
+  const a = mounted(config);
+  const configured = settingsOf(config).review;
+  const verdict = await a.ctx.runAs({ session: { id: 'session-abc' } }, () => readDecision(a.ctx.llm.stream(modernReviewCall())));
   assert.deepEqual(verdict, { risk: 'low', decision: 'allow' });
   assert.equal(a.seen.length, 1);
-  assert.equal(a.seen[0].provider, 'magpie');
-  assert.equal(a.seen[0].model, 'group/fastlight');
+  assert.deepEqual({ provider: a.seen[0].provider, model: a.seen[0].model }, configured);
   assert.equal(a.seen[0].sessionId, 'main-session-abc');
+});
+
+test('a new-style review follows a runtime route change without remounting', async () => {
+  const config = { enabled: volatileOf(true), scope: volatileOf('session'), reviewProvider: volatileOf('magpie'), reviewModel: volatileOf('group/first') };
+  const a = mounted(config);
+  await a.ctx.runAs({ session: { id: 'session-abc' } }, () => readDecision(a.ctx.llm.stream(modernReviewCall())));
+  config.reviewModel[VOLATILE_WRITE]('group/second');
+  await a.ctx.runAs({ session: { id: 'session-abc' } }, () => readDecision(a.ctx.llm.stream(modernReviewCall())));
+  assert.deepEqual(a.seen.map(call => call.model), ['group/first', 'group/second']);
+});
+
+test('a new-style review without a configured route keeps its own model', async () => {
+  const a = mounted();
+  await a.ctx.runAs({ session: { id: 'session-abc' } }, () => readDecision(a.ctx.llm.stream(modernReviewCall({ provider: 'magpie-responses', model: 'gpt-6.1-sol' }))));
+  assert.equal(a.seen[0].provider, 'magpie-responses');
+  assert.equal(a.seen[0].model, 'gpt-6.1-sol');
 });
 
 test('the llm/stream handler is synchronous and returns a stream', () => {
