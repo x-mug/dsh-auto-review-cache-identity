@@ -31,8 +31,10 @@ async function configSchema(load = loadSchemastery) {
 const POLICY_HEAD = 'REVIEW_POLICY\n'
 /** 审查策略的固定句，确认首行不是别家的同名前缀。 */
 const POLICY_MARK = 'You are the final authorization reviewer for exactly one pending tool call.'
-/** 审查正文的环境段开头。 */
-const ENVIRONMENT_HEAD = 'ENVIRONMENT\n\n'
+/** 审查正文的环境段开头；新版只隔一个换行，旧版空一行。 */
+const ENVIRONMENT_HEAD = 'ENVIRONMENT\n'
+/** 新版 DSH 给审查请求打的 purpose 标记，比消息形状可靠。 */
+const REVIEW_PURPOSE = 'auto-review'
 /** 审查正文的工程指令段分隔符。 */
 const PROJECT_SECTION = '\n\nPROJECT_INSTRUCTIONS\n\n'
 /** 审查正文的待审动作段分隔符。 */
@@ -329,7 +331,18 @@ function isReview(options) {
   const system = options.system
   if (typeof system !== 'string') return false
   if (!system.startsWith(POLICY_HEAD) || !system.includes(POLICY_MARK)) return false
-  const messages = options.messages
+  // 新版把历史拆成多条消息，形状判据会漏；purpose 是它自带的身份标记。
+  if (options.purpose === REVIEW_PURPOSE) return true
+  return legacyReviewShape(options.messages)
+}
+
+/**
+ * 旧版审查请求的形状：单条 user 消息、正文四段。
+ *
+ * @param messages - 请求里的消息数组。
+ * @returns 是否命中旧版形状。
+ */
+function legacyReviewShape(messages) {
   if (!Array.isArray(messages) || messages.length !== 1) return false
   const message = messages[0]
   if (message === null || typeof message !== 'object' || message.role !== 'user') return false
@@ -358,12 +371,13 @@ function reviewText(options) {
  * @returns 工作目录，段缺失或不是合法 JSON 时为 undefined。
  */
 function reviewCwd(text) {
+  if (!text.startsWith(ENVIRONMENT_HEAD)) return undefined
   const body = text.slice(ENVIRONMENT_HEAD.length)
+  // 新版环境段就是整条消息，没有后续段；旧版靠 PROJECT 段截断。
   const end = body.indexOf(PROJECT_SECTION)
-  if (end < 0) return undefined
   let value
   try {
-    value = JSON.parse(body.slice(0, end))
+    value = JSON.parse(end < 0 ? body : body.slice(0, end))
   } catch {
     return undefined
   }
@@ -408,19 +422,17 @@ function resolveIdentity(options, scope, sessionKey) {
 }
 
 /**
- * 换入稳定身份，只加 sessionId。
+ * 换入审查固定路由，保留 DSH 给的 sessionId。
  *
- * dsh-llm-pi-ai 把这一个字段翻成 pi-ai 的 sessionId，
- * 再由 pi-ai 写到 prompt_cache_key；其它字段逐字节带走。
+ * sessionId 同时是网关路由和请求扩展的身份，替换会改掉上游看到的会话；
+ * 缓存分档改由请求体里的 prompt_cache_key 承担。
  *
  * @param options - 原始审查请求。
- * @param identity - 稳定身份键。
  * @param override - 审查固定路由，未配置时为 undefined。
  * @returns 冻结的新请求。
  */
-function rewrite(options, identity, override) {
+function rewrite(options, override) {
   const next = { ...options }
-  if (identity !== undefined) next.sessionId = identity
   if (override !== undefined) {
     next.provider = override.provider
     next.model = override.model
@@ -436,13 +448,13 @@ function rewrite(options, identity, override) {
  * @param options - waterfall 上拿到的原始请求。
  * @param settings - 已解析的设置。
  * @param readSessionKey - 取会话 id 的函数，只在确认是审查后调用。
- * @returns 改写后的新请求，不动时为 undefined。
+ * @returns 改写后的请求与缓存身份，不动时为 undefined。
  */
 function plan(options, settings, readSessionKey) {
   if (settings.enabled !== true) return undefined
   if (options === null || typeof options !== 'object') return undefined
-  // 主闸：注入成功后 sessionId 非空，二次进入必然不再匹配。
-  if (options.sessionId !== undefined) return undefined
+  // 旧版审查没有 sessionId，这个闸门只用来挡重复改写；新版审查自带 id。
+  if (options.sessionId !== undefined && options.purpose !== REVIEW_PURPOSE) return undefined
   if (OWN_CALLS.has(options)) return undefined
   if (isAgentLoopRequest?.(options) === true) return undefined
   if (!isReview(options)) return undefined
@@ -450,7 +462,7 @@ function plan(options, settings, readSessionKey) {
   const identity = resolveIdentity(options, settings.scope, sessionKey)
   const override = reviewRoute(settings)
   if (identity === undefined && override === undefined) return undefined
-  return rewrite(options, identity, override)
+  return Object.freeze({ call: rewrite(options, override), identity })
 }
 
 /**
@@ -587,23 +599,26 @@ export function apply(ctx, config) {
         sessionKey = currentSessionId(ctx)
         return sessionKey
       }
-      let call
+      let planned
       let settings
       try {
         settings = readSettings()
-        call = plan(options, settings, readSessionKey)
+        planned = plan(options, settings, readSessionKey)
       } catch {
-        call = undefined
+        planned = undefined
       }
-      if (call === undefined) {
+      if (planned === undefined) {
         if (asked && sessionKey === undefined) noteIdentityMiss()
         return next()
       }
+      const { call } = planned
+      // 新版带 sessionId 的审查请求要靠身份键分档，取插件算的键；旧版回落到 id。
+      const identity = planned.identity ?? call.sessionId
       OWN_CALLS.add(call)
       // next() 靠 cbs.shift() 前进，任何路径都只能调一次；重放会跳过后续监听器。
       let stream
       try {
-        stream = reviewStreamScope(scope.llm.stream(call), reviewContext, call.sessionId)
+        stream = reviewStreamScope(scope.llm.stream(call), reviewContext, identity)
       } catch {
         return next()
       }
@@ -612,7 +627,7 @@ export function apply(ctx, config) {
         try {
           appendFileSync(settings.trace, `${JSON.stringify({
             at: new Date().toISOString(),
-            key: call.sessionId,
+            key: identity,
             provider: call.provider,
             model: call.model
           })}\n`)
@@ -621,7 +636,7 @@ export function apply(ctx, config) {
         }
       }
       if (settings?.log) {
-        ctx.logger?.info(`[auto-review-cache-identity] injected=${injected} key=${call.sessionId} identityMisses=${identityMisses}`)
+        ctx.logger?.info(`[auto-review-cache-identity] injected=${injected} key=${identity} identityMisses=${identityMisses}`)
       }
       return stream
     }, { global: true, prepend: true })

@@ -213,11 +213,15 @@ test('an unknown scope never injects', () => {
   assert.equal(resolveIdentity(reviewCall('C:/work/a'), 'nope', 'session-abc'), undefined);
 });
 
-test('rewrite adds only sessionId and keeps every other field', () => {
+test('plan keeps every request field and reports the cache identity apart', () => {
   const original = reviewCall('C:/work/a');
-  const next = plan(original, { enabled: true, scope: 'session', log: false }, () => 'session-abc');
+  const planned = plan(original, { enabled: true, scope: 'session', log: false }, () => 'session-abc');
+  const next = planned.call;
   assert.equal(original.sessionId, undefined);
-  assert.equal(next.sessionId, identityOf('session-abc'));
+  // sessionId 是网关路由和请求扩展的身份，不能被缓存键顶掉。
+  assert.equal(next.sessionId, undefined);
+  assert.equal(planned.identity, identityOf('session-abc'));
+  assert.equal(Object.isFrozen(planned), true);
   assert.equal(next.provider, original.provider);
   assert.equal(next.model, original.model);
   assert.equal(next.temperature, original.temperature);
@@ -228,17 +232,40 @@ test('rewrite adds only sessionId and keeps every other field', () => {
   assert.equal(Object.isFrozen(next), true);
 });
 
-test('an existing sessionId is never rewritten by a second instance', () => {
+test('a rewritten request is never rewritten twice', async () => {
+  const a = mounted({ enabled: true, scope: 'session', log: false, review: { provider: 'magpie', model: 'group/fastlight' } });
+  const original = reviewCall('C:/work/a');
+  await a.ctx.runAs({ session: { id: 'session-abc' } }, () => readDecision(a.ctx.llm.stream(original)));
+  // 改写后的调用会再进 waterfall，靠对象标记跳过第二次，也不会再读发起者。
+  assert.equal(a.seen.length, 1);
+  assert.equal(a.seen[0].provider, 'magpie');
+  assert.equal(a.ctx.initiatorCalls.count, 1);
+});
+
+test('a new-style review keeps the DSH session id and its multi-message shape', () => {
   const settings = { enabled: true, scope: 'session', log: false };
-  const once = plan(reviewCall('C:/work/a'), settings, () => 'session-abc');
-  assert.equal(plan(once, settings, () => 'session-abc'), undefined);
-  assert.equal(plan(once, settings, () => 'session-def'), undefined);
+  const modern = {
+    ...reviewCall('C:/work/a'),
+    purpose: 'auto-review',
+    sessionId: 'main-session-x',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'ENVIRONMENT\n{"cwd":"C:/work/a"}' }] },
+      { role: 'user', content: [{ type: 'text', text: '{"kind":"user-message"}' }] }
+    ]
+  };
+  assert.equal(isReview(modern), true);
+  const planned = plan(modern, settings, () => 'session-abc');
+  assert.equal(planned.call.sessionId, 'main-session-x');
+  assert.equal(planned.identity, identityOf('session-abc'));
+  // 去掉 purpose 后只剩旧形状判据，多条消息不算审查。
+  const { purpose, ...legacy } = modern;
+  assert.equal(isReview(legacy), false);
 });
 
 test('a configured review route replaces provider and model only', () => {
   const original = reviewCall('C:/work/a');
   const settings = { enabled: true, scope: 'session', log: false, review: { provider: 'magpie', model: 'group/other' } };
-  const next = plan(original, settings, () => 'session-abc');
+  const next = plan(original, settings, () => 'session-abc').call;
   assert.equal(next.provider, 'magpie');
   assert.equal(next.model, 'group/other');
   assert.equal(next.messages, original.messages);
@@ -274,41 +301,35 @@ test('plain config values still work and an incomplete route is ignored', () => 
   assert.deepEqual(settingsOf({ review: { provider: 'magpie', model: 'group/x' } }).review, { provider: 'magpie', model: 'group/x' });
 });
 
-test('injects a session key inside the initiator scope across awaits', async () => {
-  const a = mounted();
+test('rewrites the route inside the initiator scope across awaits', async () => {
+  const a = mounted({ enabled: true, scope: 'session', log: false, review: { provider: 'magpie', model: 'group/fastlight' } });
   const verdict = await a.ctx.runAs({ session: { id: 'session-abc' } }, async () => {
     await sleep();
     return readDecision(a.ctx.llm.stream(reviewCall('C:/work/a')));
   });
   assert.deepEqual(verdict, { risk: 'low', decision: 'allow' });
   assert.equal(a.seen.length, 1);
-  assert.equal(a.seen[0].sessionId, identityOf('session-abc'));
+  assert.equal(a.seen[0].provider, 'magpie');
+  assert.equal(a.seen[0].model, 'group/fastlight');
 });
 
-test('the same session reuses the key and another session changes it', async () => {
-  const a = mounted();
-  await a.ctx.runAs({ session: { id: 'session-abc' } }, () => readDecision(a.ctx.llm.stream(reviewCall('C:/work/a'))));
-  await a.ctx.runAs({ session: { id: 'session-abc' } }, async () => {
-    await sleep();
-    return readDecision(a.ctx.llm.stream(reviewCall('C:/work/b')));
-  });
-  await a.ctx.runAs({ session: { id: 'session-xyz' } }, () => readDecision(a.ctx.llm.stream(reviewCall('C:/work/a'))));
-  assert.equal(a.seen[1].sessionId, a.seen[0].sessionId);
-  assert.equal(a.seen[2].sessionId, identityOf('session-xyz'));
-  assert.notEqual(a.seen[2].sessionId, a.seen[0].sessionId);
+test('the same session reuses the identity and another session changes it', () => {
+  const settings = { enabled: true, scope: 'session', log: false };
+  const first = plan(reviewCall('C:/work/a'), settings, () => 'session-abc').identity;
+  const second = plan(reviewCall('C:/work/b'), settings, () => 'session-abc').identity;
+  const other = plan(reviewCall('C:/work/a'), settings, () => 'session-xyz').identity;
+  assert.equal(first, second);
+  assert.equal(other, identityOf('session-xyz'));
+  assert.notEqual(first, other);
 });
 
 test('parallel initiator scopes never mix keys', async () => {
-  const parallel = mounted();
-  await Promise.all([
-    parallel.ctx.runAs({ session: { id: 'session-p1' } }, async () => {
-      await sleep();
-      return readDecision(parallel.ctx.llm.stream(reviewCall('C:/work/p')));
-    }),
-    parallel.ctx.runAs({ session: { id: 'session-p2' } }, () => readDecision(parallel.ctx.llm.stream(reviewCall('C:/work/p'))))
+  const settings = { enabled: true, scope: 'session', log: false };
+  const [a, b] = await Promise.all([
+    (async () => { await sleep(); return plan(reviewCall('C:/work/p'), settings, () => 'session-p1').identity })(),
+    Promise.resolve(plan(reviewCall('C:/work/p'), settings, () => 'session-p2').identity)
   ]);
-  const keys = parallel.seen.map((call) => call.sessionId).sort();
-  assert.deepEqual(keys, [identityOf('session-p1'), identityOf('session-p2')].sort());
+  assert.deepEqual([a, b], [identityOf('session-p1'), identityOf('session-p2')]);
 });
 
 test('a missing initiator leaves the call untouched and warns once', async () => {
@@ -331,10 +352,41 @@ test('a missing or disposed agents service never throws', () => {
   assert.equal(currentSessionId(throwing), undefined);
 });
 
-test('the cwd scope ignores the initiator session', async () => {
-  const cwdOnly = mounted({ enabled: true, scope: 'cwd', log: false });
-  await cwdOnly.ctx.runAs({ session: { id: 'session-abc' } }, () => readDecision(cwdOnly.ctx.llm.stream(reviewCall('C:/work/a'))));
-  assert.equal(cwdOnly.seen[0].sessionId, identityOf('C:/work/a'));
+test('the cwd scope ignores the initiator session', () => {
+  const planned = plan(reviewCall('C:/work/a'), { enabled: true, scope: 'cwd', log: false }, () => 'session-abc');
+  assert.equal(planned.identity, identityOf('C:/work/a'));
+});
+
+test('the cwd scope reads the single-line environment of a new-style review', () => {
+  const modern = {
+    ...reviewCall('C:/work/old'),
+    purpose: 'auto-review',
+    sessionId: 'main-session-x',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'ENVIRONMENT\n{"cwd":"C:/work/new"}' }] }]
+  };
+  const planned = plan(modern, { enabled: true, scope: 'cwd', log: false }, () => 'session-abc');
+  assert.equal(planned.identity, identityOf('C:/work/new'));
+});
+
+test('a new-style review reaches the adapter on the configured review route', async () => {
+  const a = mounted({ enabled: true, scope: 'session', log: false, review: { provider: 'magpie', model: 'group/fastlight' } });
+  const modern = {
+    ...reviewCall('C:/work/a'),
+    provider: 'magpie',
+    model: 'group/smartworker',
+    purpose: 'auto-review',
+    sessionId: 'main-session-abc',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'ENVIRONMENT\n{"cwd":"C:/work/a"}' }] },
+      { role: 'user', content: [{ type: 'text', text: '{"kind":"user-message"}' }] }
+    ]
+  };
+  const verdict = await a.ctx.runAs({ session: { id: 'session-abc' } }, () => readDecision(a.ctx.llm.stream(modern)));
+  assert.deepEqual(verdict, { risk: 'low', decision: 'allow' });
+  assert.equal(a.seen.length, 1);
+  assert.equal(a.seen[0].provider, 'magpie');
+  assert.equal(a.seen[0].model, 'group/fastlight');
+  assert.equal(a.seen[0].sessionId, 'main-session-abc');
 });
 
 test('the llm/stream handler is synchronous and returns a stream', () => {
@@ -406,7 +458,8 @@ test('settings are read per call, so a runtime change applies without remounting
   await ctx.runAs({ session: { id: 'session-live' } }, () => readDecision(ctx.llm.stream(reviewCall('C:/work/b'))));
   assert.equal(seen[1].provider, 'magpie');
   assert.equal(seen[1].model, 'group/edited-at-runtime');
-  assert.equal(seen[1].sessionId, identityOf('session-live'));
+  // 旧形状请求没有 sessionId，插件也不再往里塞缓存键。
+  assert.equal(seen[1].sessionId, undefined);
 });
 
 test('disposing the plugin removes the listener', async () => {
