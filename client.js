@@ -7,6 +7,27 @@ window.__ModuleLoader__.load({
     const NS = 'local-auto-review-cache-identity'
     const dictionaries = {"en":{"meta":{"title":"Auto review cache identity","description":"Give built-in Auto review calls a stable prompt-cache identity, and optionally run them on a fixed model."},"title":"Auto review cache identity","subtitle":"Pin the model Auto review uses; leave empty to follow the main conversation.","provider":"Provider","model":"Model","followMain":"Follow main conversation","save":"Save","saved":"Saved","raw":"Raw details","readFailed":"Read failed: {message}","saveFailed":"Save failed: {message}","sectionTitle":"Auto review model","loading":"Loading configuration…","unavailable":"Configuration unavailable","readOnly":"Configuration is read-only","saving":"Saving…","saveRejected":"The host rejected the changes.","catalogRejected":"The host rejected the model catalog request."},"zh":{"meta":{"title":"Auto 审查缓存身份","description":"给内置 Auto 审查补稳定缓存身份，并可固定审查使用的模型。"},"title":"Auto 审查缓存身份","subtitle":"固定 Auto 审查使用的模型；留空则跟随主对话。","provider":"供应商","model":"模型","followMain":"跟随主对话","save":"保存","saved":"已保存","raw":"原始信息","readFailed":"读取失败：{message}","saveFailed":"保存失败：{message}","sectionTitle":"Auto 审查模型","loading":"正在读取配置…","unavailable":"配置不可用","readOnly":"配置为只读","saving":"正在保存…","saveRejected":"宿主拒绝了改动。","catalogRejected":"宿主拒绝了模型目录请求。"}}
 
+    Object.assign(dictionaries.en, {
+      recentReviews: 'Recent review model checks',
+      noReviews: 'No review requests observed yet.',
+      historyUnavailable: 'Review model checks are unavailable.',
+      routeMismatch: 'Auto review used a different model',
+      routeSent: 'Selected for sending: {route}',
+      routeExpected: 'Configured: {route}',
+      routeMatched: 'Matched',
+      dismiss: 'Dismiss'
+    })
+    Object.assign(dictionaries.zh, {
+      recentReviews: '最近的审查模型核对',
+      noReviews: '还没有观测到审查请求。',
+      historyUnavailable: '暂时无法读取审查模型核对记录。',
+      routeMismatch: 'Auto 审查选错了模型',
+      routeSent: '发送时选用：{route}',
+      routeExpected: '当时设置：{route}',
+      routeMatched: '一致',
+      dismiss: '关闭'
+    })
+
     // 完整打印原始数据，不截断。
     const pretty = (value) => {
       try {
@@ -52,7 +73,120 @@ window.__ModuleLoader__.load({
     // 原生弹层默认白底，选项要自己带主题色。
     const OPTION = { background: 'var(--dsw-alias-bg-l2, #1b1c1e)', color: 'var(--dsw-alias-label-primary, #f7f8f8)' }
 
-    function Picker({ remote, form, t }) {
+    const historyPath = 'api/auto-review-cache-identity/recent'
+    const historyInitial = { generation: null, recent: [], unavailable: false }
+    const routeLabel = ({ provider, model }) => `${provider} / ${model}`
+    const errorColor = 'var(--dsw-alias-state-error-primary)'
+
+    function createHistory() {
+      let snapshot = historyInitial
+      const listeners = new Set()
+      return {
+        getSnapshot: () => snapshot,
+        subscribe(listener) {
+          listeners.add(listener)
+          return () => listeners.delete(listener)
+        },
+        publish(next) {
+          if (next.generation === snapshot.generation && next.recent.at(-1)?.id === snapshot.recent.at(-1)?.id
+            && next.unavailable === snapshot.unavailable) {
+            return
+          }
+          snapshot = next
+          for (const listener of listeners) {
+            listener()
+          }
+        }
+      }
+    }
+
+    async function readHistory(signal) {
+      const url = new URL(historyPath, document.baseURI)
+      const fetch = globalThis.__DSH_TRANSPORT__?.fetch ?? globalThis.fetch
+      const response = await fetch(url, { signal })
+      if (!response.ok) {
+        throw new Error(`Auto review model checks: HTTP ${response.status}`)
+      }
+      const { generation, recent } = await response.json()
+      if (typeof generation !== 'string' || !Array.isArray(recent)) {
+        throw new Error('Auto review model checks: invalid response')
+      }
+      return { generation, recent, unavailable: false }
+    }
+
+    function ReviewNotice({ history, t }) {
+      const [alert, setAlert] = react.useState(null)
+      react.useEffect(() => {
+        const controller = new AbortController()
+        let refreshTimer
+        let dismissTimer
+        const check = async () => {
+          const before = history.getSnapshot()
+          try {
+            const next = await readHistory(controller.signal)
+            if (controller.signal.aborted) {
+              return
+            }
+            history.publish(next)
+            // 页面首次读取只建立基准，同一页面继续接收插件重载后的新记录。
+            const lastId = before.generation === next.generation ? before.recent.at(-1)?.id ?? 0 : 0
+            const mismatch = before.generation === null
+              ? undefined : next.recent.findLast(item => item.id > lastId && item.mismatch)
+            if (mismatch !== undefined) {
+              setAlert(mismatch)
+              clearTimeout(dismissTimer)
+              dismissTimer = setTimeout(() => setAlert(null), 8000)
+            }
+          } catch {
+            if (!controller.signal.aborted) {
+              history.publish({ ...before, unavailable: true })
+            }
+          } finally {
+            if (!controller.signal.aborted) {
+              refreshTimer = setTimeout(check, 1500)
+            }
+          }
+        }
+        void check()
+        return () => {
+          controller.abort()
+          clearTimeout(refreshTimer)
+          clearTimeout(dismissTimer)
+        }
+      }, [history])
+      if (alert === null) {
+        return null
+      }
+      const style = {
+        position: 'fixed', bottom: '24px', right: '24px', pointerEvents: 'auto',
+        maxWidth: 'min(360px, calc(100vw - 48px))', padding: '12px 16px', overflowWrap: 'anywhere',
+        background: 'var(--dsw-alias-bg-overlay)', color: 'var(--dsw-alias-label-primary)',
+        border: '1px solid var(--dsw-alias-border-l2)', borderLeft: `3px solid ${errorColor}`, borderRadius: '8px'
+      }
+      return h('div', { style },
+        h('div', { role: 'alert' },
+          h('strong', { style: { color: errorColor } }, t('routeMismatch')),
+          h('div', null, t('routeExpected', { route: routeLabel(alert.expected) })),
+          h('div', null, t('routeSent', { route: routeLabel(alert.actual) }))),
+        h('button', { type: 'button', onClick: () => setAlert(null),
+          style: { marginTop: '6px', background: 'transparent', color: 'inherit', cursor: 'pointer' } }, t('dismiss')))
+    }
+
+    function ReviewHistory({ history, t }) {
+      const { recent, unavailable } = react.useSyncExternalStore(history.subscribe, history.getSnapshot)
+      return h('details', null,
+        h('summary', null, `${t('recentReviews')} (${recent.length}/20)`),
+        unavailable && h('p', { role: 'status' }, t('historyUnavailable')),
+        !unavailable && recent.length === 0 && h('p', null, t('noReviews')),
+        recent.length > 0 && h('ul', null, recent.slice().reverse().map(item => h('li', { key: item.id },
+          `${new Date(item.at).toLocaleTimeString()} · `,
+          h('strong', { style: { color: item.mismatch ? errorColor : 'inherit' } },
+            t(item.mismatch ? 'routeMismatch' : item.expected === null ? 'followMain' : 'routeMatched')),
+          ` · ${t('routeSent', { route: routeLabel(item.actual) })}`,
+          item.mismatch && ` · ${t('routeExpected', { route: routeLabel(item.expected) })}`))))
+    }
+
+    function Picker({ remote, form, t, history }) {
       const source = react.useMemo(() => ({
         subscribe: (listener) => form?.subscribe(listener) ?? (() => {}),
         getSnapshot: () => form?.getSnapshot() ?? UNAVAILABLE
@@ -163,6 +297,7 @@ window.__ModuleLoader__.load({
           h('span', { style: S.status, role: 'status' }, hint)),
         status && status !== hint && h('p', { style: S.status, role: 'status' }, status),
         catalogError && h('p', { style: S.status, role: 'alert' }, catalogError),
+        h(ReviewHistory, { history, t }),
         h('details', { style: S.details },
           h('summary', { style: S.summary }, t('raw')),
           h('pre', { style: S.pre }, pretty(snapshot))))
@@ -175,12 +310,18 @@ window.__ModuleLoader__.load({
         try { ctx.locale.register('@x-mug/dsh-auto-review-cache-identity', dictionaries) } catch {}
       });
       const t = ctx.locale.bind('@x-mug/dsh-auto-review-cache-identity');
+      const history = createHistory()
+      ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+        name: 'shell.overlay',
+        id: 'auto-review-cache-identity.model-mismatch',
+        inject: () => ({ history, t })
+      }, ReviewNotice), 'auto-review-cache-identity: model mismatch')
       ctx.slots.inject('settings.section', () => ctx.slots.register({
         name: 'settings.section',
         id: 'auto-review-cache-identity',
         order: 60,
         label: () => t('sectionTitle'),
-        inject: () => ({ remote: ctx.remote, form: ctx.configForms.get(NS), t })
+        inject: () => ({ remote: ctx.remote, form: ctx.configForms.get(NS), history, t })
       }, Picker), 'auto-review-cache-identity: settings section')
     }
 

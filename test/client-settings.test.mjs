@@ -90,12 +90,14 @@ function makeRenderer() {
   }
 }
 
-function setup({ form, catalog = { ok: true, value: { groups: [] } } } = {}) {
+function setup({ form, catalog = { ok: true, value: { groups: [] } }, browser } = {}) {
   const renderer = makeRenderer()
   let plugin
   let registration
+  let overlay
   let registeredDictionaries
   const context = {
+    ...browser,
     window: { __ModuleLoader__: { load(module) { plugin = module.factory((name) => {
       assert.equal(name, 'react')
       return renderer.react
@@ -112,12 +114,19 @@ function setup({ form, catalog = { ok: true, value: { groups: [] } } } = {}) {
         (text, [name, value]) => text.replace(`{${name}}`, String(value)), locale.en[key]) }
     },
     effect(callback) { callback() },
-    slots: { inject(name, callback) { assert.equal(name, 'settings.section'); callback() },
-      register(options, component) { registration = { options, component } } }
+    slots: { inject(name, callback) { callback() },
+      register(options, component) {
+        if (options.name === 'settings.section') registration = { options, component }
+        if (options.name === 'shell.overlay') overlay = { options, component }
+      } }
   })
   const props = registration.options.inject()
   const view = () => renderer.render(registration.component, props)
-  return { plugin, view, current: () => renderer.current(), unmount: () => renderer.unmount(), dictionaries: registeredDictionaries }
+  const notice = () => renderer.render(overlay.component, overlay.options.inject())
+  return {
+    plugin, view, notice, current: () => renderer.current(), unmount: () => renderer.unmount(),
+    dictionaries: registeredDictionaries
+  }
 }
 
 const walk = (node, result = []) => {
@@ -134,6 +143,47 @@ const selectValue = (tree, index) => elements(tree, 'select')[index].props.value
 const optionValues = (tree, index) => elements(elements(tree, 'select')[index], 'option').map((node) => node.props.value)
 const select = (tree, index, value) => elements(tree, 'select')[index].props.onChange({ target: { value } })
 const tick = () => new Promise((resolve) => setImmediate(resolve))
+
+test('a new mismatch shows one dismissible toast with both routes, without replaying history', async () => {
+  const actual = { provider: 'main', model: 'default' }
+  const expected = { provider: 'configured', model: 'review' }
+  const mismatch = { id: 1, at: 1000, mismatch: true, actual, expected }
+  let recent = [mismatch]
+  let signal
+  const timers = new Map()
+  let timerId = 0
+  const browser = {
+    URL, AbortController, document: { baseURI: 'http://dsh.invalid/prefix/' },
+    async fetch(url, init) {
+      assert.equal(String(url), 'http://dsh.invalid/prefix/api/auto-review-cache-identity/recent')
+      signal = init.signal
+      return Response.json({ generation: 'test', recent })
+    },
+    setTimeout(callback, delay) { timers.set(++timerId, { callback, delay }); return timerId },
+    clearTimeout(id) { timers.delete(id) }
+  }
+  const poll = async () => {
+    const [id, timer] = [...timers].find(([, item]) => item.delay === 1500)
+    timers.delete(id)
+    await timer.callback()
+    await tick()
+  }
+  const ui = setup({ browser })
+  ui.notice()
+  await tick()
+  assert.equal(ui.current(), null)
+  recent = [...recent, { ...mismatch, id: 2 }]
+  await poll()
+  assert.match(textOf(ui.current()), /Auto review used a different model/)
+  assert.match(textOf(ui.current()), /configured \/ review/)
+  assert.match(textOf(ui.current()), /main \/ default/)
+  elements(ui.current(), 'button')[0].props.onClick()
+  await poll()
+  assert.equal(ui.current(), null)
+  ui.unmount()
+  assert.equal(signal.aborted, true)
+  assert.equal(timers.size, 0)
+})
 
 test('missing, unavailable and loading forms never claim to follow the main conversation', async () => {
   for (const form of [undefined, makeForm({ status: 'unavailable', writable: false }), makeForm({ status: 'loading', writable: false })]) {

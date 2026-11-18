@@ -19,5 +19,13 @@
   "readOnly": "配置为只读",
   "saving": "正在保存…",
   "saveRejected": "宿主拒绝了改动。",
-  "catalogRejected": "宿主拒绝了模型目录请求。"
+  "catalogRejected": "宿主拒绝了模型目录请求。",
+  "recentReviews": "最近的审查模型核对",
+  "noReviews": "还没有观测到审查请求。",
+  "historyUnavailable": "暂时无法读取审查模型核对记录。",
+  "routeMismatch": "Auto 审查选错了模型",
+  "routeSent": "发送时选用：{route}",
+  "routeExpected": "当时设置：{route}",
+  "routeMatched": "一致",
+  "dismiss": "关闭"
 }

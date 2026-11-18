@@ -35,6 +35,8 @@ const POLICY_MARK = 'You are the final authorization reviewer for exactly one pe
 const ENVIRONMENT_HEAD = 'ENVIRONMENT\n'
 /** 新版 DSH 给审查请求打的 purpose 标记，比消息形状可靠。 */
 const REVIEW_PURPOSE = 'auto-review'
+const REVIEW_HISTORY_LIMIT = 20
+const REVIEW_HISTORY_PATH = '/api/auto-review-cache-identity/recent'
 /** 审查正文的工程指令段分隔符。 */
 const PROJECT_SECTION = '\n\nPROJECT_INSTRUCTIONS\n\n'
 /** 审查正文的待审动作段分隔符。 */
@@ -291,8 +293,7 @@ function registerFetchHook(id, hook) {
 }
 
 /** 审核流的每次推进和取消都携带同一身份。 */
-function reviewStreamScope(stream, storage, identity) {
-  const context = { identity }
+function reviewStreamScope(stream, storage, context) {
   const iterator = storage.run(context, () => stream[Symbol.asyncIterator]())
   return {
     [Symbol.asyncIterator]() { return this },
@@ -519,6 +520,40 @@ function reviewRoute(settings) {
   return settings.review
 }
 
+function registerReviewHistory(scope, storage) {
+  const generation = randomUUID()
+  const recent = []
+  let sequence = 0
+  scope.on('llm-pi-ai/request-headers', (request, headers, next) => {
+    const result = next()
+    const review = storage.getStore()?.review
+    if (review === undefined || review.observed) {
+      return result
+    }
+    if (request.purpose !== REVIEW_PURPOSE && request.purpose !== undefined) {
+      return result
+    }
+    review.observed = true
+    const actual = { provider: request.provider, model: request.model }
+    const expected = review.expected
+    const mismatch = expected !== null && (expected.provider !== actual.provider || expected.model !== actual.model)
+    recent.push({ id: ++sequence, at: Date.now(), expected, actual, mismatch })
+    if (recent.length > REVIEW_HISTORY_LIMIT) {
+      recent.shift()
+    }
+    return result
+  }, { global: true, prepend: true })
+  scope.inject(['connection'], (owner) => {
+    owner.effect(() => owner.connection.fetch.register({
+      path: REVIEW_HISTORY_PATH,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async () => Response.json({ generation, recent }, { headers: { 'cache-control': 'no-store' } })
+    }))
+  })
+  scope.effect(() => () => { recent.length = 0 })
+}
+
 /**
  * 挂到 llm/stream 上，只动审查请求。
  *
@@ -569,9 +604,10 @@ export function apply(ctx, config) {
     const hookId = 'auto-review-cache-identity#review-cache#' + randomUUID()
     const checkpoints = new Map()
     const reviewContext = new AsyncLocalStorage()
+    registerReviewHistory(scope, reviewContext)
     const disposeFetch = registerFetchHook(hookId, async (input, init) => {
       const context = reviewContext.getStore()
-      if (context === undefined) return undefined
+      if (context === undefined || context.cache !== true) return undefined
       const settings = readSettings()
       if (!settings.enabled) return undefined
       const result = await rewriteReviewRequest(input, init, checkpoints, context.identity)
@@ -607,9 +643,15 @@ export function apply(ctx, config) {
       } catch {
         planned = undefined
       }
+      // 用 DSH 的标记识别没被改写的审查，仍按本次调用开始时的设置核对。
+      const review = settings?.enabled && !OWN_CALLS.has(options)
+        && (options?.purpose === REVIEW_PURPOSE || (options?.purpose === undefined && isReview(options)))
+        ? { expected: settings.review ?? null, observed: false }
+        : undefined
       if (planned === undefined) {
         if (asked && sessionKey === undefined) noteIdentityMiss()
-        return next()
+        const stream = next()
+        return review === undefined ? stream : reviewStreamScope(stream, reviewContext, { review })
       }
       const { call } = planned
       // 新版带 sessionId 的审查请求要靠身份键分档，取插件算的键；旧版回落到 id。
@@ -618,9 +660,10 @@ export function apply(ctx, config) {
       // next() 靠 cbs.shift() 前进，任何路径都只能调一次；重放会跳过后续监听器。
       let stream
       try {
-        stream = reviewStreamScope(scope.llm.stream(call), reviewContext, identity)
+        stream = reviewStreamScope(scope.llm.stream(call), reviewContext, { identity, cache: true, review })
       } catch {
-        return next()
+        const fallback = next()
+        return review === undefined ? fallback : reviewStreamScope(fallback, reviewContext, { review })
       }
       injected += 1
       if (settings?.trace !== undefined) {

@@ -106,6 +106,7 @@ function runtime({ adapter, agents = true }) {
       return dispose;
     },
     inject(names, callback) {
+      if (names.length === 1 && names[0] === 'connection') return;
       assert.deepEqual(names.filter((name) => name !== 'llm' && name !== 'settings'), []);
       const disposers = [];
       collector = disposers;
@@ -171,7 +172,7 @@ function mounted(settings = { enabled: true, scope: 'session', log: false }) {
   const originalInject = ctx.inject;
   ctx.inject = (names, callback) => {
     const handle = originalInject(names, callback);
-    handles.push(handle);
+    if (handle !== undefined) handles.push(handle);
     return handle;
   };
   pluginApply(ctx, settings);

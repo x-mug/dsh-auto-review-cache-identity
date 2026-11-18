@@ -19,5 +19,13 @@
   "readOnly": "Configuration is read-only",
   "saving": "Saving…",
   "saveRejected": "The host rejected the changes.",
-  "catalogRejected": "The host rejected the model catalog request."
+  "catalogRejected": "The host rejected the model catalog request.",
+  "recentReviews": "Recent review model checks",
+  "noReviews": "No review requests observed yet.",
+  "historyUnavailable": "Review model checks are unavailable.",
+  "routeMismatch": "Auto review used a different model",
+  "routeSent": "Selected for sending: {route}",
+  "routeExpected": "Configured: {route}",
+  "routeMatched": "Matched",
+  "dismiss": "Dismiss"
 }

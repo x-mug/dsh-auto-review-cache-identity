@@ -71,11 +71,16 @@ function isolateFetch(t, underlying) {
   };
 }
 
-function mountRuntime(t, adapter) {
+function mountRuntime(t, adapter, config = { enabled: true, scope: 'session' }) {
   const initiators = new AsyncLocalStorage();
   const listeners = [];
   const disposers = [];
+  let route;
+  let reviewHeaders;
   const ctx = {
+    connection: { fetch: { register(value) { route = value; return () => { route = undefined; }; } } },
+    recent: async () => (await route.fetch()).json(),
+    prepareHeaders: (request) => reviewHeaders(request, new Headers(), () => new Headers({ 'x-test': 'preserved' })),
     fiber: { uid: 'synthetic-transport-test' },
     settings: { configure: () => () => {} },
     logger: { info() {}, warn() {} },
@@ -89,6 +94,11 @@ function mountRuntime(t, adapter) {
       return cleanup;
     },
     on(name, callback) {
+      if (name === 'llm-pi-ai/request-headers') {
+        reviewHeaders = callback;
+        disposers.push(() => { reviewHeaders = undefined; });
+        return;
+      }
       assert.equal(name, 'llm/stream');
       listeners.push(callback);
       const cleanup = () => {
@@ -99,6 +109,10 @@ function mountRuntime(t, adapter) {
       return cleanup;
     },
     inject(names, callback) {
+      if (names[0] === 'connection') {
+        callback(ctx);
+        return;
+      }
       assert.deepEqual(names, ['llm']);
       callback(ctx);
     },
@@ -113,7 +127,7 @@ function mountRuntime(t, adapter) {
       return initiators.run({ session: { id: sessionId } }, callback);
     }
   };
-  apply(ctx, { enabled: true, scope: 'session' });
+  apply(ctx, config);
   t.after(() => { for (const dispose of disposers.reverse()) dispose(); });
   return ctx;
 }
@@ -199,6 +213,38 @@ test('outer HTTP tracker passes a bare Request and preserves the previous histor
     assert.equal(request.signal.aborted, true);
     assert.equal(request.signal.reason, 'synthetic cancellation');
   }
+});
+
+test('recent checks record final routes once, including reviews missed by the rewrite', async (t) => {
+  isolateFetch(t, globalThis.fetch);
+  const config = { enabled: true, reviewProvider: 'configured', reviewModel: 'initial' };
+  const ctx = mountRuntime(t, call => (async function* () {
+    await Promise.resolve();
+    const headers = ctx.prepareHeaders(call);
+    assert.equal(headers.get('x-test'), 'preserved');
+    ctx.prepareHeaders(call);
+    yield call.model;
+  })(), config);
+  const review = { ...reviewCall(), purpose: 'auto-review', sessionId: 'test-session' };
+  const matched = ctx.llm.stream(review);
+  config.reviewModel = 'updated';
+  assert.deepEqual(await drain(matched), ['initial']);
+  assert.deepEqual(await drain(ctx.llm.stream({ ...review, system: 'changed system text' })), [review.model]);
+  await drain(ctx.llm.stream({ ...review, purpose: 'compaction', system: 'unrelated request' }));
+  const first = (await ctx.recent()).recent;
+  assert.deepEqual(first.map(({ expected, actual, mismatch }) => ({ expected, actual, mismatch })), [
+    { expected: { provider: 'configured', model: 'initial' },
+      actual: { provider: 'configured', model: 'initial' }, mismatch: false },
+    { expected: { provider: 'configured', model: 'updated' },
+      actual: { provider: review.provider, model: review.model }, mismatch: true }
+  ]);
+  config.reviewModel = '';
+  for (let index = 0; index < 20; index += 1) {
+    await drain(ctx.llm.stream(review));
+  }
+  const { recent } = await ctx.recent();
+  assert.equal(recent.length, 20);
+  assert.ok(recent.every(row => row.expected === null && !row.mismatch));
 });
 
 test('request helper accepts string init bodies and keeps explicit identities separate from shared headers', async () => {
@@ -356,7 +402,7 @@ test('scoped iterator preserves identity and arguments across awaited next, retu
       return iterator;
     }
   };
-  const scoped = reviewStreamScope(stream, storage, identity);
+  const scoped = reviewStreamScope(stream, storage, { identity });
   assert.equal(scoped.then, undefined);
   assert.equal(scoped[Symbol.asyncIterator](), scoped);
   assert.equal(storage.getStore(), undefined);
@@ -388,7 +434,7 @@ test('breaking a scoped stream keeps identity in asynchronous generator cleanup'
       observations.push(['cleanup:after', storage.getStore()?.identity]);
     }
   })();
-  for await (const chunk of reviewStreamScope(stream, storage, 'synthetic-cancel-identity')) {
+  for await (const chunk of reviewStreamScope(stream, storage, { identity: 'synthetic-cancel-identity' })) {
     assert.equal(chunk, 'synthetic chunk');
     assert.equal(storage.getStore(), undefined);
     break;
@@ -409,7 +455,7 @@ test('scoped streams propagate the original generator error without retaining re
     await Promise.resolve();
     assert.deepEqual(storage.getStore(), { identity: 'synthetic-error-identity' });
     throw failure;
-  })(), storage, 'synthetic-error-identity');
+  })(), storage, { identity: 'synthetic-error-identity' });
   assert.deepEqual(await stream.next(), { value: 'synthetic chunk', done: false });
   await assert.rejects(stream.next(), error => error === failure);
   assert.equal(storage.getStore(), undefined);
@@ -429,7 +475,7 @@ test('parallel scoped streams keep independent identities while their awaited wo
       await Promise.resolve();
       observations.push([identity, 'return', storage.getStore()?.identity]);
     }
-  })(), storage, identity);
+  })(), storage, { identity });
   const streams = [makeStream('synthetic-stream-a', gates[0]), makeStream('synthetic-stream-b', gates[1])];
   const pending = streams.map(stream => stream.next());
   assert.equal(storage.getStore(), undefined);
