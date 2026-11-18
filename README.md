@@ -2,7 +2,7 @@
 
 给 DeepSeek Harness 内置 Auto 审查单独指定模型，并帮助支持的接口复用审查输入缓存。
 
-本文对应 **1.2.2**。使用 DSH Desktop **0.2.2-rc.1** 或更新版本时，请把插件更新到 **1.2.2**。旧版 DSH 的单消息审查也能识别。
+本文对应 **1.2.3**。使用 DSH Desktop **0.2.2-rc.1** 或更新版本时，请把插件更新到 **1.2.2** 或更新版本。旧版 DSH 的单消息审查也能识别。
 
 ## 为什么需要它
 
@@ -26,7 +26,7 @@ DSH 0.2.2-rc.1 起，审查带上 `purpose: 'auto-review'` 和 `sessionId`，历
 github:x-mug/dsh-auto-review-cache-identity
 ```
 
-固定到 1.2.2 可填写 `github:x-mug/dsh-auto-review-cache-identity#v1.2.2`，也可用 Release 压缩包直链。已有安装用插件管理器更新。安装后按提示重载，并在设置页打开「Auto 审查模型」。开发期间用过本地来源的，发布后切回远程安装，核对实际版本与锁定记录。变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
+固定到 1.2.3 可填写 `github:x-mug/dsh-auto-review-cache-identity#v1.2.3`，也可用 Release 压缩包直链。已有安装用插件管理器更新。安装后按提示重载，并在设置页打开「Auto 审查模型」。开发期间用过本地来源的，发布后切回远程安装，核对实际版本与锁定记录。变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ## 配置
 
