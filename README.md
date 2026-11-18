@@ -1,20 +1,18 @@
 # Auto 审查缓存身份（@x-mug/dsh-auto-review-cache-identity）
 
-给内置 Auto 审查（`@deepseek-ai/dsh-experimental-auto-review`）的模型调用补一个稳定的缓存身份，让审查请求的 prompt 前缀能跨调用复用；同时可以在设置页里给审查单独指定一个模型。
+给 DeepSeek Harness 内置 Auto 审查单独指定模型，并帮助支持的接口复用审查输入缓存。
 
-版本 **1.2.1**，插件包名为 `@x-mug/dsh-auto-review-cache-identity`。兼容基线为 **DeepSeek Harness Desktop 0.2.1-rc.5 / Cordis 4.0.5**。插件依赖 DSH 内部的服务钩子与客户端槽位，其他版本需要重新验证。
+本文对应 **1.2.2**。使用 DSH Desktop **0.2.2-rc.1** 或更新版本时，请把插件更新到 **1.2.2**。旧版 DSH 的单消息审查也能识别。
 
 ## 为什么需要它
 
-Auto 预设下每个工具调用都要先过一次 LLM 审查。审查请求由 `classifyRisk` 构造，只有 `provider / model / system / messages / temperature / signal`，**没有 sessionId**。
+内置 Auto 审查默认沿用主会话的模型。安装插件后，可以在设置页指定另一组供应商和模型。审查请求匹配后，插件保留 DSH 提供的会话 ID 和请求内容，只覆盖所配置的供应商与模型。
 
-缺少会话身份会影响网关的请求归组与路由。对 Anthropic 而言，还需要稳定的内容块边界和显式 `cache_control`；身份本身不能替代缓存断点。
-
-本插件在 `llm/stream` 上补稳定的 `sessionId`。会话头插件使用这个身份；pi-ai 是否发送 `prompt_cache_key` 由所选 API 与兼容配置决定。原生 Anthropic 审核请求在发送前再补历史缓存断点。
+DSH 0.2.2-rc.1 起，审查带上 `purpose: 'auto-review'` 和 `sessionId`，历史也可以拆成多条消息。插件 1.2.1 会跳过这类请求，设置页即使显示了固定模型，审查也可能照旧沿用主会话。1.2.2 支持新版请求。
 
 ## 功能
 
-- **稳定身份**：`"auto-review:" + sha256(会话 id)[:32]`，原始会话 id 不出现在请求里。
+- **独立审查缓存**。支持的审核接口可以使用按会话生成的缓存键。DSH 自带的 `sessionId` 保持原值。
 - **可选固定审查模型**：设置页里选供应商与模型；留空跟随主对话。
 - **Anthropic 历史缓存**：按历史条目分块，保留前一轮与当前轮的显式断点；完整文本、角色和顺序不变，待审动作不打标。
 - **异常回退原请求**：插件失败时仍执行原有审核，不改变审核的拒绝行为。
@@ -28,7 +26,7 @@ Auto 预设下每个工具调用都要先过一次 LLM 审查。审查请求由 
 github:x-mug/dsh-auto-review-cache-identity
 ```
 
-本仓库根目录就是插件包；也可使用本机源码目录，或使用已发布版本的 Release 压缩包。安装后按提示重启或重载，并在设置页确认「Auto 审查模型」分区。固定版本可在版本 tag 发布后使用 `github:x-mug/dsh-auto-review-cache-identity#v<版本>`。升级时先移除旧版本，再安装新版本。变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
+固定到 1.2.2 可填写 `github:x-mug/dsh-auto-review-cache-identity#v1.2.2`，也可用 Release 压缩包直链。已有安装用插件管理器更新。安装后按提示重载，并在设置页打开「Auto 审查模型」。开发期间用过本地来源的，发布后切回远程安装，核对实际版本与锁定记录。变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ## 配置
 
@@ -46,11 +44,11 @@ bundle 默认值只有两项，其余都留给设置页或 profile 补丁：
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 关掉后监听器直接放过所有请求。 |
-| `scope` | `session` | `session`：键 = `sha256(会话 id)`，读不到会话则本次不注入；`cwd`：键 = `sha256(cwd)`，完全不读发起者作用域，只用于 A/B 对照。 |
+| `scope` | `session` | 默认按发起者会话计算缓存身份。`cwd` 按审查环境里的工作目录计算，仅用于对照实验。 |
 | `reviewProvider` | 空 | 审查固定使用的供应商 id，空 = 跟随主对话。 |
 | `reviewModel` | 空 | 审查固定使用的模型 id，空 = 跟随主对话。 |
 
-`reviewProvider` / `reviewModel` 两个字符串都非空才会覆盖路由；只填一个等于没填。
+同时选择供应商和模型后，下一笔审查使用当前设置。一项留空时沿用原请求的模型。比如要走 FastLight，可在供应商 `magpie` 的模型目录里选 `group/fastlight`。
 
 **profile 用户层按条目 id 覆盖 `config`，是整体替换、不是深合并。** 删掉用户层某个字段不会回落到 bundle 默认值，而是回落到 schema 默认值。要么只保留一层配置，要么两层始终写全。
 
@@ -78,11 +76,17 @@ bundle 默认值只有两项，其余都留给设置页或 profile 补丁：
 2. 写入是 CAS：客户端用读到的 revision 提交，过期会被拒绝并提示保存失败，重新打开设置页再存即可。
 3. **表单依赖随插件安装。** `@deepseek-ai/schemastery` 是必装依赖，本地 link 源码目录也需要安装依赖。缺少依赖时插件加载会明确报错，不再静默丢失表单。
 
-自定义分区下方有「原始信息」，展开可查看宿主提供的表单状态。宿主没有注册表单、配置不可读或不可写时，下拉和保存按钮会禁用，不把读取失败伪装成「跟随主对话」。
+自定义分区的「原始信息」显示宿主提供的表单状态。宿主未注册表单，或配置不可读写时，页面会禁用下拉和保存按钮。
+
+### 核对实际审查模型
+
+1. 打开正在运行的 profile，在插件管理器确认安装版本至少为 1.2.2。如果曾用本地源码或覆盖过安装文件，通过插件管理器从远程重新安装，让安装文件和锁定记录一致。
+2. 在「Auto 审查模型」保存供应商和模型，然后触发一次实际的自动审查。
+3. 对照插件 trace 里的 `provider` / `model` 和网关的审查请求。仅有 `mounted` 记录表示插件已加载。改写记录及网关收到的模型与当前设置相符，才能验证固定模型已生效。
 
 ## Anthropic 缓存断点
 
-审核供应商需选择原生 `anthropic-messages` 通道，例如本机 `magpie-anthropic`。Chat Completions 和 Responses 请求不经过此正文改写。
+原生 `anthropic-messages` 通道（例如 `magpie-anthropic`）使用旧版单消息审查正文时，插件会添加下列缓存断点。新版多消息请求沿用适配器的内容边界，审查模型仍可单独配置。
 
 - 使用独立的异步 fetch 调度器，支持普通参数和 desktop HTTP 跟踪器生成的 `Request`；请求正文只读副本，跟踪器照常工作。
 - 用异步作用域把缓存处理限制到内置审核流；普通模型请求不解析正文，会话头插件继续独立工作。
@@ -95,15 +99,15 @@ bundle 默认值只有两项，其余都留给设置页或 profile 补丁：
 
 2026-11-03 经本机 Magpie 0.1.2838 → LiteLLM Haiku 的合成集成测试：首次写入 15,819 token；追加一条历史后读取 15,819 token，仅新增写入 34 token。1.1.0 的此项合成验证未覆盖 desktop 外层 HTTP 跟踪器。1.1.1 已补相同调用链的回归测试；本机 desktop 真实审核在 21:17:06 读取 166,894 token、写入 2,931 token、未缓存输入 3,874 token，读取占总输入约 96.08%。单笔结果不代表所有会话或账号的长期命中率。
 
-## 失败即放行
+## 回退到原审查
 
 | 情况 | 行为 |
 |---|---|
 | 插件内部抛错（识别、解析、摘要任一环） | 吞掉，走 `next()` 派发原始请求 |
 | 认不出是审查 | 走 `next()` |
-| 拿不到发起者会话 | 不注入，走 `next()`（计数并在日志里说明一次） |
-| `agents` 服务缺失、被 dispose、不在发起者作用域内 | 同上 |
-| 已有 `sessionId`（另一个实例注入过） | 不再改写 |
+| 拿不到发起者会话 | 仍可覆盖已配置的审查模型。也拿不到缓存身份且未配置模型时，沿用原请求。 |
+| 旧形状请求已带 `sessionId` | 沿用原请求。新版带有审查标记的请求仍参与模型选择。 |
+| 已由本插件改写并重新派发 | 跳过重复改写，继续使用已选模型。 |
 | 配置的档位名不认识 | 启动时 warn，整插件不注入 |
 | 拿不到 `llm` 服务 | 插件保持惰性 |
 
@@ -111,22 +115,14 @@ bundle 默认值只有两项，其余都留给设置页或 profile 补丁：
 
 ## 识别判据与顺序
 
-必须同时满足，任何一条不满足都不算审查：
+两种请求都要满足 `temperature === 0`。`system` 必须以 `REVIEW_POLICY\n` 开头，且含固定句 `You are the final authorization reviewer for exactly one pending tool call.`。
 
-1. `temperature === 0`
-2. `system` 以 `REVIEW_POLICY\n` 开头，且含固定句
-   `You are the final authorization reviewer for exactly one pending tool call.`
-3. `messages` 恰好 1 条，role 为 `user`
-4. 该消息恰好 1 个 `type: "text"` 块
-5. 正文以 `ENVIRONMENT\n\n` 开头，且含 `\n\nPROJECT_INSTRUCTIONS\n\n` 与 `\n\nPENDING_ACTION\n\n`
-
-主对话、压缩（`purpose: "compaction"`）、标题（`purpose: "session-title"`）、subagent、以及 approve-for-me 自己的审查（`>>> APPROVAL REQUEST START`，system 不同）都不满足 2-5。
-
-判定顺序是为了让热路径不付钱：
+- 新版请求带 `purpose: 'auto-review'`，可以有多条消息和 DSH 提供的 `sessionId`。
+- 兼容旧版请求时，检查一条 `user` 消息中的单个文本块。正文以 `ENVIRONMENT\n` 开头，且含 `PROJECT_INSTRUCTIONS` 与 `PENDING_ACTION` 段。
 
 ```text
-enabled → options.sessionId 已存在 → OWN_CALLS → isAgentLoopRequest → isReview
-        → 这时才 currentInitiator() → resolveIdentity → reviewRoute
+检查是否启用 → 排除已处理请求和主对话 → 验证审查标记和策略
+             → 读取发起者会话 → 计算缓存身份 → 应用当前模型设置
 ```
 
 `currentInitiator()` 每次都是真读 AsyncLocalStorage，所以放在确认是审查之后。另有一道独立护栏：`@deepseek-ai/dsh-llm` 导出的 `isAgentLoopRequest(options)`，它只标记 agent loop 的正常对话请求；拿不到这个导出时自动退化为上面的弱护栏。
@@ -139,35 +135,37 @@ ctx.get('agents')?.currentInitiator()?.session?.id
 
 审查发生在 `tools/pre-execute` 的监听器里、`ctx.llm.stream` 之前，同一条 await 链，所以读到的就是发起这次工具调用的会话。服务被 dispose 后 `currentInitiator()` 会抛，读取必须包 `try`。
 
-**读不到会话就不注入，原样放过。** 不退回 cwd：同一目录下几十个互不相干的会话和子代理会塌成同一个身份，把几十条审查链塞进一条缓存，还让它们长期共用一个账号——"稳定地错"比"没有"危险，而且从日志和命中率上都看不出来。
+会话档按发起者会话区分缓存。同目录的会话也能独立。工作目录档在显式选择 `cwd` 时使用。发起者会话缺失时，已配置的模型仍可覆盖。在支持缓存键的接口上，可用请求自带的会话 ID 作为后备。
 
 ## OpenAI 审核路径
 
-`/v1/chat/completions` 与 `/v1/responses` 的审核请求同样改写：按历史条目拆成多条消息，稳定头部单独成段，待审动作留在末尾，并补 `prompt_cache_key` 固定缓存分区。策略消息既可能是 `system` 也可能是 `developer`，两种都识别。
+- `/v1/chat/completions` 识别 `system` 或 `developer` 中的策略。匹配旧版正文时，把历史拆分成消息并按缓存身份设置 `prompt_cache_key`。新版多消息沿用 DSH 生成的请求体。
+- `/v1/responses` 从 `instructions` 识别策略，沿用原输入分段。有缓存身份时设置 `prompt_cache_key`。
 
 ## 已知限制
 
-1. 缓存断点只作用于本插件识别的原生 Anthropic 审核流；不接管普通对话和其他 API。
-2. 审核模型仍须遵守内置判决协议，解析失败由内置审核拒绝；本插件不降低审核要求。
-3. `onPayload` 会被当前 DSH 适配器的选项白名单丢弃，因此缓存标记在最终 fetch 请求上添加。
-4. 缓存要求相同的前缀、兼容的缓存 TTL、有效期和上游缓存分区；切换账号、改写历史或过期仍可能未命中。
-5. `scope: cwd` 仅用于对照实验；长期使用应按会话区分身份。
-6. 设置页的 volatile 配置实时生效；代码和包版本的加载状态以 desktop 实际重载结果为准。
+1. 缓存处理取决于接口和请求格式。固定模型的选择发生在发请求前，也支持新版多消息审查。
+2. 审核模型需遵守内置判决协议。解析失败时由内置审核拒绝。
+3. DSH 适配器会过滤 `onPayload`，因此缓存标记在发送请求时添加。
+4. 缓存要求相同的前缀、兼容的缓存 TTL、有效期和上游缓存分区。切换账号、改写历史或过期仍可能未命中。
+5. `scope: cwd` 用于对照实验。长期使用可选默认的会话档。
+6. 保存模型设置后，下一笔审查读取新值。更新插件版本后，按宿主提示重载。
 
 ## 回退
 
-把 `enabled` 设成 `false`，或从 `dsh.profile.bundles` 里移除后重启。两种回退都不影响已经保存的设置值。
+把 `enabled` 设成 `false` 即可恢复内置审查的模型选择。
 
 ## 开发
 
-需要 **Node.js 24**，核心测试不需要第三方依赖，无需执行 `npm install`：
+使用 **Node.js 24**。先安装依赖，再运行检查。
 
 ```powershell
+npm install --ignore-scripts
 npm test
 npm run check
 ```
 
-等价的直接命令为：
+等价的直接检查命令为：
 
 ```powershell
 node --test --test-isolation=none test/*.test.mjs
@@ -175,8 +173,8 @@ node --check index.js
 node --check client.js
 ```
 
-离线测试用迷你 cordis 复刻 waterfall 语义、真实 AsyncLocalStorage 模拟发起者作用域，覆盖审查识别、身份推导、并发不串号、volatile 配置解引用、运行期改设置、失败放行、卸载恢复，覆盖缓存前缀、并发身份和共享钩子的回归项。自动化测试不代表真实 GUI 验收；设置分区、下拉框和保存按钮还需要在应用里点一遍。
+离线测试覆盖新版审查使用当前设置的路由、设置保存后下一笔审查跟随新值、留空时保留原模型以及保持 `sessionId`。也覆盖旧版识别、缓存处理和卸载。桌面验收用当前 profile 的设置触发一次真实审查，再比对网关记录。
 
 客户端部分不需要构建：`client.js` 是手写的 `window.__ModuleLoader__.load({ id, factory })` 工厂函数，React 由 loader 注入，直接 `require('react')`。宿主部分（`index.js`）只读配置、挂 `llm/stream`，没有编译产物。
 
-插件形态、配置读取、`llm/stream` 拦截、设置分区等通用注意事项见 [DSH 插件开发经验](../../docs/PLUGIN-DEVELOPMENT.md)。
+插件形态与发布后恢复远程安装的流程见 [DSH 插件开发经验](https://github.com/x-mug/dsh-plugins/blob/main/docs/PLUGIN-DEVELOPMENT.md)。

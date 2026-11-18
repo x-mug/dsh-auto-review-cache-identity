@@ -3,7 +3,7 @@
 ## 1.2.2 — 2026-11-16
 
 - 识别新版 DSH 的审查请求：以 `purpose: 'auto-review'` 加策略首行判定，不再要求单条消息。
-- 新版审查自带 `sessionId`，改写只替换 provider/model；缓存身份改由请求体的 `prompt_cache_key` 承担，网关拿到的会话 id 保持原值。
+- 保留 DSH 提供的 `sessionId`。模型选择读取当前配置。支持缓存键的请求体使用 `prompt_cache_key` 区分审查缓存。
 - 环境段兼容新版的一行写法，`cwd` 档仍能读出工作目录。
 
 ## 1.1.2 — 2026-11-04
